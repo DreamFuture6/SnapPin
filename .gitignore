@@ -1,0 +1,66 @@
+# Build directory
+/build/
+/out/
+/cmake-build-*/
+/x64/
+/x86/
+/Debug/
+/Release/
+/RelWithDebInfo/
+/MinSizeRel/
+
+# CMake generated files
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/install_manifest.txt
+/CTestTestfile.cmake
+/compile_commands.json
+/CMakeUserPresets.json
+
+# Visual Studio / IDE
+/.vs/
+/.idea/
+/.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.opendb
+*.opensdf
+*.sdf
+*.ncb
+*.ipch
+
+# MSVC intermediate files
+*.obj
+*.iobj
+*.ipdb
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+*.recipe
+
+# Logs / dumps / temp files
+*.log
+*.tmp
+*.temp
+*.cache
+*.dmp
+SnapPin.log
+
+# OS generated files
+Thumbs.db
+Desktop.ini
+
+# Local environment / secrets
+.env
+.env.*
+*.local
+*.local.*
+local.settings.json
