@@ -50,7 +50,7 @@ bool HotkeyService::RegisterOne(HWND hwnd, int id, HotkeyConfig cfg, std::wstrin
         }
 
         if (err == ERROR_HOTKEY_ALREADY_REGISTERED) {
-            errorText = L"快捷键被占用。建议改为 Ctrl+Shift+1/2/3/4 或 Alt+Shift+S/F/P/H。";
+            errorText = L"快捷键被占用。";
         } else {
             errorText = L"快捷键注册失败。";
         }

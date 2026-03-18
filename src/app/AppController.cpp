@@ -3,10 +3,14 @@
 #include "core/CrashHandler.h"
 #include "core/ImageCodecUtil.h"
 #include "core/Logger.h"
+#include "common/KnownFolderUtil.h"
+#include "common/WindowMessagePayload.h"
+#include "ui/WindowUtil.h"
 #include <thread>
 
 namespace {
 AppController* g_appController = nullptr;
+constexpr wchar_t kMainWindowClassName[] = L"SnapPinMainHiddenWindowClass";
 
 struct PendingOcrResult {
     OcrResult result;
@@ -66,16 +70,7 @@ std::wstring NowText() {
 }
 
 std::filesystem::path GetDesktopDirectory() {
-    PWSTR path = nullptr;
-    std::filesystem::path out;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &path)) && path) {
-        out = path;
-        CoTaskMemFree(path);
-    }
-    if (out.empty()) {
-        out = std::filesystem::temp_directory_path();
-    }
-    return out;
+    return KnownFolderUtil::GetPathOr(FOLDERID_Desktop, std::filesystem::temp_directory_path());
 }
 
 std::filesystem::path EffectivePinSaveDir(const AppSettings& settings, const SettingsService& service) {
@@ -151,15 +146,16 @@ bool AppController::Initialize(HINSTANCE hInstance) {
     history_.Compact();
     LoadPinStates();
 
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = AppController::WndProc;
-    wc.hInstance = hInstance_;
-    wc.lpszClassName = L"SnapPinMainHiddenWindowClass";
-    RegisterClassW(&wc);
+    static std::once_flag classOnce;
+    WindowUtil::RegisterWindowClassOnce(
+        classOnce,
+        hInstance_,
+        kMainWindowClassName,
+        AppController::WndProc);
 
     hwnd_ = CreateWindowExW(
         0,
-        wc.lpszClassName,
+        kMainWindowClassName,
         L"SnapPinMain",
         WS_OVERLAPPED,
         CW_USEDEFAULT,
@@ -194,8 +190,7 @@ bool AppController::Initialize(HINSTANCE hInstance) {
 
     std::wstring error;
     if (!hotkeys_.Register(hwnd_, settings_, error)) {
-        MessageBoxW(hwnd_, error.c_str(), L"快捷键注册失败", MB_OK | MB_ICONERROR);
-        return false;
+        MessageBoxW(hwnd_, (error + L"\n程序将继续运行，但快捷键功能不可用。").c_str(), L"快捷键注册失败", MB_OK | MB_ICONWARNING);
     }
 
     ApplyAutoStart(settings_.autoStart);
@@ -242,6 +237,9 @@ LRESULT CALLBACK AppController::KeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             return CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
         if (g_appController->overlay_ && g_appController->overlay_->IsOpen()) {
+            if (g_appController->overlay_->IsEscPassthroughMode()) {
+                return CallNextHookEx(nullptr, nCode, wParam, lParam);
+            }
             if (g_appController->overlay_->IsInputSuppressed()) {
                 return CallNextHookEx(nullptr, nCode, wParam, lParam);
             }
@@ -447,7 +445,7 @@ void AppController::OnPinControlHotkey() {
     lastPinControlHotkeyTick_ = now;
     if (isDoubleTap) {
         ClosePinsOnCurrentMonitor();
-        tray_.ShowNotification(L"SnapPin", L"已清除固定在当前页面的所有贴图。", 1200);
+        tray_.ShowNotification(L"SnapPin", L"已清除固定的所有贴图。", 1200);
         return;
     }
     TogglePinsOnCurrentMonitorVisibility();
@@ -571,7 +569,7 @@ LRESULT AppController::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         RemovePin(reinterpret_cast<PinWindow*>(wParam));
         return 0;
     case WMAPP_OCR_COMPLETE: {
-        std::unique_ptr<PendingOcrResult> payload(reinterpret_cast<PendingOcrResult*>(lParam));
+        auto payload = WindowMessagePayload::Take<PendingOcrResult>(lParam);
         if (!payload) {
             return 0;
         }
@@ -748,10 +746,9 @@ void AppController::StartOcrAsync(Image image, const std::optional<RECT>& select
             Logger::Instance().Error(result.text);
         }
 
-        auto* payload = new PendingOcrResult{ std::move(result), selectionScreenRect };
-        if (!PostMessageW(owner, WMAPP_OCR_COMPLETE, 0, reinterpret_cast<LPARAM>(payload))) {
+        auto payload = std::make_unique<PendingOcrResult>(PendingOcrResult{ std::move(result), selectionScreenRect });
+        if (!WindowMessagePayload::Post(owner, WMAPP_OCR_COMPLETE, 0, std::move(payload))) {
             Logger::Instance().Error(L"OCR result dispatch failed.");
-            delete payload;
         }
     }).detach();
 }
@@ -1343,5 +1340,3 @@ void AppController::SavePinStates() {
             << L"\n";
     }
 }
-
-

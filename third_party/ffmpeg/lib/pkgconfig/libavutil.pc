@@ -1,0 +1,14 @@
+prefix=/c/Users/lenovo/Desktop/SnapPin/third_party/ffmpeg
+exec_prefix=${prefix}
+libdir=/c/Users/lenovo/Desktop/SnapPin/third_party/ffmpeg/lib
+includedir=/c/Users/lenovo/Desktop/SnapPin/third_party/ffmpeg/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 59.39.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: user32.lib bcrypt.lib
+Cflags: -I${includedir}

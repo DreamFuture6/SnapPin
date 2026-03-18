@@ -1,12 +1,16 @@
 ﻿#pragma once
+
 #include "common.h"
 #include "core/Annotation.h"
 #include "core/CaptureService.h"
 #include "core/ClipboardService.h"
 #include "core/Exporter.h"
 #include "core/Image.h"
+#include "core/ScreenRecorder.h"
 #include "ui/GdiBitmapBuffer.h"
+#include "ui/PreviewBarWindow.h"
 #include "ui/ToolbarWindow.h"
+#include "ui/VideoPreviewPlayer.h"
 
 enum class OverlayAction {
     Cancel,
@@ -34,7 +38,7 @@ public:
     static void PreloadUi(HINSTANCE hInstance);
     void SetGuideLinesEnabled(bool enabled) { guideLinesEnabled_ = enabled; }
     bool Show(HINSTANCE hInstance, const ScreenCapture& capture, bool fullScreenSelection, FinishedCallback callback,
-        const std::optional<RECT>& fullSelectionScreenRect = std::nullopt);
+              const std::optional<RECT>& fullSelectionScreenRect = std::nullopt);
     void Close();
     bool IsOpen() const { return hwnd_ != nullptr; }
     bool TryHandleColorCopyHotkey();
@@ -42,6 +46,7 @@ public:
     void ExitToCursorMode();
     HWND Hwnd() const { return hwnd_; }
     bool IsInputSuppressed() const { return toolbar_.IsColorDialogOpen(); }
+    bool IsEscPassthroughMode() const { return screenRecordingMode_ || recordingPreviewMode_; }
 
 private:
     enum class Stage {
@@ -87,6 +92,21 @@ private:
     void OnToolbarCommand(UINT id, UINT notifyCode);
     void EnterLongCaptureMode();
     void EnterWhiteboardMode();
+    void EnterScreenRecordingMode();
+    bool StartScreenRecording();
+    void StopScreenRecording(bool enterPreview);
+    void EnterRecordingPreviewMode(const ScreenRecordingResult& result);
+    void ExitRecordingPreviewMode(bool discardTempFile);
+    void RestoreOverlayWindowStyle();
+    void ApplyRecordingOverlayWindowStyle();
+    void ApplyPreviewOverlayWindowStyle();
+    void EnsurePreviewHostWindow();
+    void DestroyPreviewHostWindow();
+    void StopWindowTimer(UINT_PTR& timerId);
+    void StopOverlayTimers();
+    void RefreshPreviewPlacement();
+    void UpdateRecordingPreviewProgress();
+    std::filesystem::path BuildRecordingTempPath() const;
     void OnLongCaptureTimer();
     void UpdateLongCaptureThumbnailCache(float dpiScale, bool force);
     bool CaptureTargetWindowFrame(Image& outFrame);
@@ -102,7 +122,8 @@ private:
     void DestroyHudWindows();
     void RefreshFollowHudFromLastMouse();
     void UpdateHudWindows(std::optional<RECT> infoRect, std::optional<RECT> magnifierRect,
-        std::optional<RECT> verticalGuideRect = std::nullopt, std::optional<RECT> horizontalGuideRect = std::nullopt);
+                          std::optional<RECT> verticalGuideRect = std::nullopt,
+                          std::optional<RECT> horizontalGuideRect = std::nullopt);
     void DrawMagnifierPanel(Gdiplus::Graphics& g, const RECT& panelRect, POINT centerPt, float dpiScale) const;
     void DrawCursorInfoPanel(Gdiplus::Graphics& g, const RECT& panelRect, POINT centerPt, float dpiScale) const;
     void DrawEditingShortcutHint(Gdiplus::Graphics& g, float dpiScale, const RECT& selectionRect) const;
@@ -110,6 +131,8 @@ private:
     void DrawWhiteboardLayer(Gdiplus::Graphics& g, float dpiScale);
     void RenderStaticScene(Gdiplus::Graphics& g, float dpiScale);
     void DrawCurrentShapePreview(Gdiplus::Graphics& g, const RECT& selectionRect);
+    void ClearFollowHud();
+    void RefreshToolbarPlacement(bool forceRedraw = true);
     std::optional<RECT> HitWindow(POINT screenPt) const;
     std::optional<RECT> ComputeCursorInfoRect(POINT p) const;
     std::optional<RECT> ComputeMagnifierRect(POINT p) const;
@@ -169,16 +192,16 @@ private:
     HitKind activeHit_ = HitKind::None;
     HitKind activeShapeHit_ = HitKind::None;
 
-    RECT selection_{}; // local coordinates
+    RECT selection_{};
     RECT initialSelection_{};
     POINT dragStart_{};
     POINT lastMouse_{};
     bool mouseLeaveTracking_ = false;
     bool precisionModeActive_ = false;
-    POINT precisionLastRaw_{}; 
+    POINT precisionLastRaw_{};
     double precisionMouseX_ = 0.0;
     double precisionMouseY_ = 0.0;
-    RECT precisionBounds_{}; // local-space clamp bounds for shift precision mode
+    RECT precisionBounds_{};
 
     std::optional<RECT> hoverWindowRect_;
     bool cursorInfoEnabled_ = false;
@@ -200,12 +223,19 @@ private:
 
     bool longCaptureMode_ = false;
     bool whiteboardMode_ = false;
+    bool screenRecordingMode_ = false;
+    bool recordingPreviewMode_ = false;
+    bool recordingStartPending_ = false;
     UINT_PTR longCaptureTimer_ = 0;
+    UINT_PTR recordingStartTimer_ = 0;
+    UINT_PTR previewProgressTimer_ = 0;
     HWND longCaptureTargetHwnd_ = nullptr;
+    HWND preRecordingForegroundHwnd_ = nullptr;
+    HWND previewVideoHostHwnd_ = nullptr;
     Image longCaptureImage_{};
     Image longCaptureLastFrame_{};
     int longCaptureViewportOffsetY_ = 0;
-    int longCaptureScrollDir_ = 0; // +1 append downward, -1 upward
+    int longCaptureScrollDir_ = 0;
     bool longCaptureMatchAccepted_ = true;
     std::optional<RECT> longCaptureThumbRect_;
     struct LongCaptureThumbCache {
@@ -223,6 +253,16 @@ private:
     LongCaptureThumbCache longCaptureThumbCache_{};
     bool longCaptureThumbDirty_ = false;
     DWORD longCaptureThumbLastRenderTick_ = 0;
+    bool recordingActive_ = false;
+    bool recordingPaused_ = false;
+    bool previewSeekTracking_ = false;
+    bool previewSeekResumeAfterRelease_ = false;
+    bool previewSeekWarmupNeeded_ = false;
+    bool previewExporting_ = false;
+    std::unique_ptr<ScreenRecorder> screenRecorder_;
+    std::optional<ScreenRecordingResult> lastRecordingResult_;
+    std::filesystem::path recordingTempPath_;
+    std::unique_ptr<VideoPreviewPlayer> previewPlayer_;
 
     ToolType tool_ = ToolType::None;
     COLORREF currentColor_ = RGB(255, 0, 0);
@@ -253,6 +293,7 @@ private:
     std::vector<std::vector<AnnotationShape>> redoStack_;
 
     ToolbarWindow toolbar_;
+    PreviewBarWindow previewBar_;
     bool toolbarHiddenByShiftPrecision_ = false;
     FinishedCallback callback_;
     Exporter exporter_;

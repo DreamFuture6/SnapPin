@@ -1,17 +1,8 @@
-﻿#include "core/Settings.h"
+#include "core/Settings.h"
 #include "core/Logger.h"
+#include "common/KnownFolderUtil.h"
 
 namespace {
-std::filesystem::path GetKnownFolder(REFKNOWNFOLDERID id) {
-    PWSTR path = nullptr;
-    std::filesystem::path out;
-    if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &path)) && path) {
-        out = path;
-        CoTaskMemFree(path);
-    }
-    return out;
-}
-
 int ReadInt(const std::wstring& file, const wchar_t* section, const wchar_t* key, int defaultValue) {
     return GetPrivateProfileIntW(section, key, defaultValue, file.c_str());
 }
@@ -30,7 +21,7 @@ void WriteInt(const std::wstring& file, const wchar_t* section, const wchar_t* k
 }
 
 bool SettingsService::Initialize() {
-    baseDir_ = GetKnownFolder(FOLDERID_LocalAppData) / L"SnapPin";
+    baseDir_ = KnownFolderUtil::GetPathOr(FOLDERID_LocalAppData, std::filesystem::temp_directory_path()) / L"SnapPin";
     historyDir_ = baseDir_ / L"History";
     tempDir_ = baseDir_ / L"Temp";
     configPath_ = baseDir_ / L"settings.ini";

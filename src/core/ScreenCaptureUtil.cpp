@@ -88,11 +88,35 @@ private:
     HGDIOBJ oldObject_ = nullptr;
 };
 
+void DrawCursorOnCapture(HDC targetDc, const RECT& captureRect)
+{
+    if (!targetDc) {
+        return;
+    }
+
+    CURSORINFO cursorInfo{};
+    cursorInfo.cbSize = sizeof(cursorInfo);
+    if (!GetCursorInfo(&cursorInfo) || (cursorInfo.flags & CURSOR_SHOWING) == 0 || !cursorInfo.hCursor) {
+        return;
+    }
+
+    ICONINFO iconInfo{};
+    if (!GetIconInfo(cursorInfo.hCursor, &iconInfo)) {
+        return;
+    }
+
+    BitmapHandle maskBitmap(iconInfo.hbmMask);
+    BitmapHandle colorBitmap(iconInfo.hbmColor);
+    const int drawX = cursorInfo.ptScreenPos.x - static_cast<int>(iconInfo.xHotspot) - captureRect.left;
+    const int drawY = cursorInfo.ptScreenPos.y - static_cast<int>(iconInfo.yHotspot) - captureRect.top;
+    DrawIconEx(targetDc, drawX, drawY, cursorInfo.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+}
+
 } // namespace
 
 namespace ScreenCaptureUtil {
 
-bool CaptureScreenRect(const RECT& screenRect, Image& outImage) {
+bool CaptureScreenRect(const RECT& screenRect, Image& outImage, bool captureLayeredWindows, bool captureCursor) {
     outImage = {};
 
     const RECT normalized = NormalizeRect(screenRect);
@@ -132,8 +156,12 @@ bool CaptureScreenRect(const RECT& screenRect, Image& outImage) {
     }
 
     if (!BitBlt(memoryDc.get(), 0, 0, width, height, screenDc.get(),
-            normalized.left, normalized.top, SRCCOPY | CAPTUREBLT)) {
+            normalized.left, normalized.top, (captureLayeredWindows ? (SRCCOPY | CAPTUREBLT) : SRCCOPY))) {
         return false;
+    }
+
+    if (captureCursor) {
+        DrawCursorOnCapture(memoryDc.get(), normalized);
     }
 
     Image image = Image::Create(width, height);

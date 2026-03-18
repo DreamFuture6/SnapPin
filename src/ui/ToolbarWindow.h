@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "common.h"
 #include "core/Annotation.h"
 
@@ -15,6 +15,8 @@ public:
     void SetActiveTool(ToolType tool);
     void SetLongCaptureMode(bool enabled);
     void SetWhiteboardMode(bool enabled);
+    void SetScreenRecordingMode(bool enabled);
+    void SetRecordingState(bool active, bool paused);
 
     float StrokeWidth() const;
     COLORREF StrokeColor() const { return strokeColor_; }
@@ -23,6 +25,10 @@ public:
     float TextSize() const;
     INT TextStyle() const;
     COLORREF TextColor() const { return textColor_; }
+    int RecordingDelayMs() const;
+    int RecordingFps() const;
+    bool RecordSystemAudioEnabled() const { return recordSystemAudioValue_; }
+    bool RecordMicrophoneAudioEnabled() const { return recordMicrophoneAudioValue_; }
 
     bool ChooseStrokeColor(HWND owner);
     bool ChooseFillColor(HWND owner);
@@ -31,6 +37,8 @@ public:
     bool IsModeButtonId(UINT id) const;
     ToolType ToolFromButtonId(UINT id) const;
     bool IsColorDialogOpen() const { return colorDialogOpen_; }
+    static bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiScale,
+                                bool recordingActive = false, bool recordingPaused = false);
 
     HWND Hwnd() const { return hwnd_; }
 
@@ -55,6 +63,7 @@ private:
     bool IsComboRelatedControl(HWND hwnd) const;
     UINT ButtonIdFromTool(ToolType tool) const;
     void UpdateDpiFont();
+    void ApplyRecordingControlState();
 
     HWND hwnd_ = nullptr;
     HWND parent_ = nullptr;
@@ -74,6 +83,8 @@ private:
     HBRUSH comboBgBrush_ = nullptr;
     UINT hoveredControlId_ = 0;
     UINT pendingHoverId_ = 0;
+    UINT openComboControlId_ = 0;
+    int openComboSelectionIndex_ = -1;
     DWORD hoverSinceTick_ = 0;
     bool trackedTooltipVisible_ = false;
     std::wstring trackedTooltipText_;
@@ -85,6 +96,8 @@ private:
     HWND cmbTextSize_ = nullptr;
     HWND cmbTextStyle_ = nullptr;
     HWND btnTextColor_ = nullptr;
+    HWND cmbRecordDelay_ = nullptr;
+    HWND cmbRecordFps_ = nullptr;
 
     ToolType activeTool_ = ToolType::None;
     float strokeWidthValue_ = 2.0f;
@@ -99,4 +112,11 @@ private:
     DWORD colorDialogBlockUntilTick_ = 0;
     bool longCaptureMode_ = false;
     bool whiteboardMode_ = false;
+    bool screenRecordingMode_ = false;
+    bool recordingActive_ = false;
+    bool recordingPaused_ = false;
+    int recordingDelayMsValue_ = 0;
+    int recordingFpsValue_ = 24;
+    bool recordSystemAudioValue_ = true;
+    bool recordMicrophoneAudioValue_ = false;
 };

@@ -1,6 +1,8 @@
 ﻿#include "ui/PinWindow.h"
 #include "ui/FontManager.h"
 #include "ui/UiUtil.h"
+#include "ui/WindowUtil.h"
+#include "common/KnownFolderUtil.h"
 
 namespace
 {
@@ -34,30 +36,11 @@ namespace
 
     std::filesystem::path DefaultSavePath()
     {
-        PWSTR path = nullptr;
-        std::filesystem::path out;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &path)) && path) {
-            out = path;
-            CoTaskMemFree(path);
-        } else {
-            out = std::filesystem::temp_directory_path();
-        }
+        std::filesystem::path out = KnownFolderUtil::GetPathOr(FOLDERID_Pictures, std::filesystem::temp_directory_path());
         out /= (L"SnapPin_Pin_" + FormatNowForFile() + L".png");
         return out;
     }
 
-    void RegisterPinWindowClassOnce(std::once_flag &once, HINSTANCE hInstance, WNDPROC proc)
-    {
-        std::call_once(once, [hInstance, proc]() {
-            WNDCLASSW wc{};
-            wc.lpfnWndProc   = proc;
-            wc.hInstance     = hInstance;
-            wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
-            wc.lpszClassName = kPinWindowClassName;
-            wc.hbrBackground = nullptr;
-            RegisterClassW(&wc);
-        });
-    }
 }
 
 PinWindow::PinWindow() = default;
@@ -69,7 +52,12 @@ PinWindow::~PinWindow()
 void PinWindow::PreloadClass(HINSTANCE hInstance)
 {
     static std::once_flag once;
-    RegisterPinWindowClassOnce(once, hInstance, PinWindow::WndProc);
+    WindowUtil::RegisterWindowClassOnce(
+        once,
+        hInstance,
+        kPinWindowClassName,
+        PinWindow::WndProc,
+        LoadCursorW(nullptr, IDC_ARROW));
 }
 
 bool PinWindow::Create(HINSTANCE hInstance, const Image &image, const std::optional<RECT> &screenRect,

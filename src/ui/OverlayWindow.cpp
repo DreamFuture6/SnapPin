@@ -1,9 +1,12 @@
-﻿#include "ui/OverlayWindow.h"
+#include "ui/OverlayWindow.h"
 #include "app/AppIds.h"
 #include "core/AnnotationRenderer.h"
 #include "core/Logger.h"
 #include "core/ScreenCaptureUtil.h"
+#include "common/KnownFolderUtil.h"
+#include "common/WindowMessagePayload.h"
 #include "ui/GdiObject.h"
+#include "ui/WindowUtil.h"
 #include <thread>
 
 namespace {
@@ -14,9 +17,12 @@ constexpr size_t kMaxUndo = 200;
 constexpr UINT ID_OVERLAY_TEXT_EDIT = 62001;
 constexpr UINT WMU_OVERLAY_TEXT_COMMIT = WM_APP + 401;
 constexpr UINT WMU_OVERLAY_TEXT_CANCEL = WM_APP + 402;
+constexpr UINT WMU_PREVIEW_EXPORT_DONE = WM_APP + 403;
 constexpr UINT_PTR IDT_LONG_CAPTURE = 7301;
 constexpr UINT kLongCaptureTickMs = 12;
 constexpr DWORD kLongCaptureThumbRefreshMs = 33;
+constexpr UINT_PTR IDT_RECORDING_START = 7302;
+constexpr UINT_PTR IDT_PREVIEW_PROGRESS = 7303;
 constexpr COLORREF kLongCaptureColorKey = RGB(1, 0, 1);
 constexpr wchar_t kOverlayWindowClassName[] = L"SnapPinOverlayWindowClass";
 constexpr wchar_t kOverlayHudWindowClassName[] = L"SnapPinOverlayHudWindowClass";
@@ -40,6 +46,12 @@ struct VerticalSsdMatch {
     double error = 1.0;
     double secondError = 1.0;
     bool matched = false;
+};
+
+struct PreviewExportDonePayload {
+    bool success = false;
+    std::wstring outputPath;
+    std::wstring errorMessage;
 };
 
 void BuildGrayLuma(const Image& src, std::vector<uint8_t>& outGray) {
@@ -558,14 +570,7 @@ bool IsNearRectBorder(const RECT& rc, POINT p, int thickness) {
 }
 
 std::filesystem::path DefaultSelectionSavePath() {
-    PWSTR path = nullptr;
-    std::filesystem::path out;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &path)) && path) {
-        out = path;
-        CoTaskMemFree(path);
-    } else {
-        out = std::filesystem::temp_directory_path();
-    }
+    std::filesystem::path out = KnownFolderUtil::GetPathOr(FOLDERID_Desktop, std::filesystem::temp_directory_path());
     out /= (L"SnapPin_" + FormatNowForFile() + L".png");
     return out;
 }
@@ -583,22 +588,42 @@ LRESULT CALLBACK TextEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     }
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
+
+LRESULT CALLBACK PreviewHostSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR, DWORD_PTR) {
+    auto forwardMouseMessageToParent = [&](UINT forwardMsg) -> LRESULT {
+        HWND parent = GetParent(hwnd);
+        if (!parent) {
+            return 0;
+        }
+        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ClientToScreen(hwnd, &pt);
+        ScreenToClient(parent, &pt);
+        return SendMessageW(parent, forwardMsg, wParam, MAKELPARAM(pt.x, pt.y));
+    };
+    switch (msg) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+        return TRUE;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_MOUSEMOVE:
+        return forwardMouseMessageToParent(msg);
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, PreviewHostSubclassProc, 1);
+        break;
+    default:
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
 }
 
 bool ScaleImageBicubic(const Image& src, int dstW, int dstH, Image& out);
-
-void RegisterWindowClassOnce(std::once_flag& once, HINSTANCE hInstance, WNDPROC proc,
-    LPCWSTR className, HCURSOR cursor) {
-    std::call_once(once, [hInstance, proc, className, cursor]() {
-        WNDCLASSW wc{};
-        wc.lpfnWndProc = proc;
-        wc.hInstance = hInstance;
-        wc.hCursor = cursor;
-        wc.lpszClassName = className;
-        wc.hbrBackground = nullptr;
-        RegisterClassW(&wc);
-    });
-}
 
 OverlayWindow::OverlayWindow() = default;
 OverlayWindow::~OverlayWindow() {
@@ -608,10 +633,18 @@ OverlayWindow::~OverlayWindow() {
 void OverlayWindow::PreloadUi(HINSTANCE hInstance) {
     static std::once_flag overlayClassOnce;
     static std::once_flag overlayHudClassOnce;
-    RegisterWindowClassOnce(overlayClassOnce, hInstance, OverlayWindow::WndProc,
-        kOverlayWindowClassName, LoadCursorW(nullptr, IDC_CROSS));
-    RegisterWindowClassOnce(overlayHudClassOnce, hInstance, OverlayWindow::HudWndProc,
-        kOverlayHudWindowClassName, LoadCursorW(nullptr, IDC_CROSS));
+    WindowUtil::RegisterWindowClassOnce(
+        overlayClassOnce,
+        hInstance,
+        kOverlayWindowClassName,
+        OverlayWindow::WndProc,
+        LoadCursorW(nullptr, IDC_CROSS));
+    WindowUtil::RegisterWindowClassOnce(
+        overlayHudClassOnce,
+        hInstance,
+        kOverlayHudWindowClassName,
+        OverlayWindow::HudWndProc,
+        LoadCursorW(nullptr, IDC_CROSS));
 }
 
 bool OverlayWindow::Show(HINSTANCE hInstance, const ScreenCapture& capture, bool fullScreenSelection, FinishedCallback callback,
@@ -627,6 +660,11 @@ bool OverlayWindow::Show(HINSTANCE hInstance, const ScreenCapture& capture, bool
     hoverWindowRect_.reset();
     followHudEnabled_ = true;
     toolbarHiddenByShiftPrecision_ = false;
+    screenRecordingMode_ = false;
+    recordingPreviewMode_ = false;
+    recordingStartPending_ = false;
+    recordingActive_ = false;
+    recordingPaused_ = false;
 
     PreloadUi(hInstance_);
 
@@ -709,8 +747,14 @@ bool OverlayWindow::Show(HINSTANCE hInstance, const ScreenCapture& capture, bool
     EnsureStaticSceneBitmap();
 
     toolbar_.Create(hwnd_, hInstance_);
+    previewBar_.Create(hwnd_, hInstance_);
+    previewBar_.Hide();
+    previewPlayer_ = std::make_unique<VideoPreviewPlayer>(hwnd_);
+    screenRecorder_ = std::make_unique<ScreenRecorder>();
     toolbar_.SetLongCaptureMode(false);
     toolbar_.SetWhiteboardMode(false);
+    toolbar_.SetScreenRecordingMode(false);
+    toolbar_.SetRecordingState(false, false);
     toolbar_.SetActiveTool(tool_);
     ApplyToolbarStyle();
     EnsureHudWindows();
@@ -723,36 +767,51 @@ bool OverlayWindow::Show(HINSTANCE hInstance, const ScreenCapture& capture, bool
     SetFocus(hwnd_);
 
     if (stage_ == Stage::Annotating && HasSelection()) {
-        toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
-        if (toolbar_.Hwnd()) {
-            RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-        }
+        RefreshToolbarPlacement();
         RefreshFollowHudFromLastMouse();
     } else {
         toolbar_.Hide();
-        lastInfoRect_.reset();
-        lastMagnifierRect_.reset();
-        lastVerticalGuideRect_.reset();
-        lastHorizontalGuideRect_.reset();
-        UpdateHudWindows(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+        ClearFollowHud();
     }
 
     return true;
 }
 
 void OverlayWindow::Close() {
-    if (longCaptureTimer_ != 0 && hwnd_) {
-        KillTimer(hwnd_, longCaptureTimer_);
-        longCaptureTimer_ = 0;
+    StopWindowTimer(recordingStartTimer_);
+    StopWindowTimer(previewProgressTimer_);
+    if (screenRecorder_) {
+        screenRecorder_->Cancel();
     }
+    if (previewPlayer_) {
+        previewPlayer_->Close();
+    }
+    DestroyPreviewHostWindow();
+    StopWindowTimer(longCaptureTimer_);
+
+    std::error_code ec;
+    if (!recordingTempPath_.empty()) {
+        std::filesystem::remove(recordingTempPath_, ec);
+    }
+    recordingTempPath_.clear();
+    lastRecordingResult_.reset();
+
     longCaptureMode_ = false;
     whiteboardMode_ = false;
+    screenRecordingMode_ = false;
+    recordingPreviewMode_ = false;
+    recordingStartPending_ = false;
+    recordingActive_ = false;
+    recordingPaused_ = false;
     longCaptureTargetHwnd_ = nullptr;
+    preRecordingForegroundHwnd_ = nullptr;
     longCaptureScrollDir_ = 0;
     longCaptureMatchAccepted_ = true;
     longCaptureThumbRect_.reset();
     toolbar_.SetLongCaptureMode(false);
     toolbar_.SetWhiteboardMode(false);
+    toolbar_.SetScreenRecordingMode(false);
+    toolbar_.SetRecordingState(false, false);
     toolbar_.SetActiveTool(ToolType::None);
     longCaptureThumbCacheReady_ = false;
     longCaptureThumbDirty_ = false;
@@ -761,6 +820,10 @@ void OverlayWindow::Close() {
     EndTextEdit(false);
     DestroyHudWindows();
     toolbarHiddenByShiftPrecision_ = false;
+    previewBar_.Hide();
+    if (previewBar_.Hwnd()) {
+        previewBar_.Destroy();
+    }
     if (toolbar_.Hwnd()) {
         toolbar_.Destroy();
     }
@@ -769,6 +832,22 @@ void OverlayWindow::Close() {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
+}
+
+void OverlayWindow::StopWindowTimer(UINT_PTR& timerId) {
+    if (timerId == 0) {
+        return;
+    }
+    if (hwnd_) {
+        KillTimer(hwnd_, timerId);
+    }
+    timerId = 0;
+}
+
+void OverlayWindow::StopOverlayTimers() {
+    StopWindowTimer(longCaptureTimer_);
+    StopWindowTimer(recordingStartTimer_);
+    StopWindowTimer(previewProgressTimer_);
 }
 
 bool OverlayWindow::TryHandleColorCopyHotkey() {
@@ -831,10 +910,7 @@ void OverlayWindow::ExitToCursorMode() {
     tool_ = ToolType::None;
     toolbar_.SetActiveTool(tool_);
     ApplyToolbarStyle();
-    toolbar_.ShowNear(SelectionRectNormalized(), RECT{ 0, 0, capture_.image.width, capture_.image.height });
-    if (toolbar_.Hwnd()) {
-        RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-    }
+    RefreshToolbarPlacement();
     MarkSceneDirty();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -913,6 +989,32 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (longCaptureMode_) {
             return HTTRANSPARENT;
         }
+        if (screenRecordingMode_) {
+            if (!HasSelection()) {
+                return HTTRANSPARENT;
+            }
+            POINT screenPt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            POINT localPt = ScreenToLocalPoint(screenPt);
+            RECT sr = SelectionRectNormalized();
+            const HitKind hit = HitTestRectHandles(sr, localPt, kHandleSize + 8);
+            const float dpiScale = static_cast<float>(GetDpiForWindow(hwnd_) ? GetDpiForWindow(hwnd_) : 96) / 96.0f;
+            const int borderGrab = std::max(6, static_cast<int>(std::round(kSelectionBorderGrab * dpiScale)));
+            const bool onBorder = (hit != HitKind::None && hit != HitKind::Inside) || IsNearRectBorder(sr, localPt, borderGrab);
+            return onBorder ? HTCLIENT : HTTRANSPARENT;
+        }
+        if (recordingPreviewMode_) {
+            if (!HasSelection()) {
+                return HTTRANSPARENT;
+            }
+            POINT screenPt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            POINT localPt = ScreenToLocalPoint(screenPt);
+            RECT sr = SelectionRectNormalized();
+            const HitKind hit = HitTestRectHandles(sr, localPt, kHandleSize + 8);
+            const float dpiScale = static_cast<float>(GetDpiForWindow(hwnd_) ? GetDpiForWindow(hwnd_) : 96) / 96.0f;
+            const int borderGrab = std::max(6, static_cast<int>(std::round(kSelectionBorderGrab * dpiScale)));
+            const bool onBorder = (hit != HitKind::None && hit != HitKind::Inside) || IsNearRectBorder(sr, localPt, borderGrab);
+            return (onBorder || PtInRect(&sr, localPt)) ? HTCLIENT : HTTRANSPARENT;
+        }
         return DefWindowProcW(hwnd_, msg, wParam, lParam);
     case WM_PAINT:
         OnPaint();
@@ -920,6 +1022,17 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER:
         if (wParam == IDT_LONG_CAPTURE) {
             OnLongCaptureTimer();
+            return 0;
+        }
+        if (wParam == IDT_RECORDING_START) {
+            KillTimer(hwnd_, IDT_RECORDING_START);
+            recordingStartTimer_ = 0;
+            recordingStartPending_ = false;
+            StartScreenRecording();
+            return 0;
+        }
+        if (wParam == IDT_PREVIEW_PROGRESS) {
+            UpdateRecordingPreviewProgress();
             return 0;
         }
         return DefWindowProcW(hwnd_, msg, wParam, lParam);
@@ -935,8 +1048,7 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         return DefWindowProcW(hwnd_, msg, wParam, lParam);
-    case WM_MOUSEMOVE:
-    {
+    case WM_MOUSEMOVE: {
         if (!mouseLeaveTracking_) {
             TRACKMOUSEEVENT tme{};
             tme.cbSize = sizeof(tme);
@@ -962,7 +1074,7 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_MOUSEACTIVATE:
-        if (longCaptureMode_) {
+        if (longCaptureMode_ || screenRecordingMode_ || recordingPreviewMode_) {
             return MA_NOACTIVATE;
         }
         return DefWindowProcW(hwnd_, msg, wParam, lParam);
@@ -999,7 +1111,7 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         return DefWindowProcW(hwnd_, msg, wParam, lParam);
-    case WM_MOUSELEAVE: {
+    case WM_MOUSELEAVE:
         mouseLeaveTracking_ = false;
         lastMouse_ = POINT{-32768, -32768};
         hoverWindowRect_.reset();
@@ -1012,9 +1124,12 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         UpdateHudWindows(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
-    }
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
+            if (recordingPreviewMode_) {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                return TRUE;
+            }
             POINT p{};
             GetCursorPos(&p);
             ScreenToClient(hwnd_, &p);
@@ -1063,10 +1178,7 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             precisionModeActive_ = false;
             if (toolbarHiddenByShiftPrecision_) {
                 if (stage_ == Stage::Annotating && HasSelection() && !longCaptureMode_) {
-                    toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
-                    if (toolbar_.Hwnd()) {
-                        RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-                    }
+                    RefreshToolbarPlacement();
                 }
                 toolbarHiddenByShiftPrecision_ = false;
             }
@@ -1105,6 +1217,45 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         OnToolbarCommand(LOWORD(wParam), HIWORD(wParam));
         return 0;
+    case WMAPP_VIDEO_PREVIEW_EVENT:
+        if (wParam == VideoPreviewPlayer::EventReady) {
+            const LONGLONG duration = previewPlayer_ ? previewPlayer_->Duration100ns() : (lastRecordingResult_.has_value() ? lastRecordingResult_->duration100ns : 0);
+            if (previewPlayer_) {
+                previewPlayer_->SetRate(previewBar_.PlaybackRate());
+                previewPlayer_->PrimeFirstFrame(0);
+            }
+            const LONGLONG position = previewPlayer_ ? previewPlayer_->Position100ns() : 0;
+            previewBar_.SetPreviewMetrics(duration, position);
+            previewBar_.SetPlaying(false);
+            previewSeekWarmupNeeded_ = false;
+        } else if (wParam == VideoPreviewPlayer::EventEnded) {
+            const LONGLONG duration = previewPlayer_ ? previewPlayer_->Duration100ns() : (lastRecordingResult_.has_value() ? lastRecordingResult_->duration100ns : 0);
+            previewBar_.SetPlaying(false);
+            previewBar_.SetPreviewMetrics(duration, duration);
+            previewSeekWarmupNeeded_ = true;
+        } else if (wParam == VideoPreviewPlayer::EventError) {
+            previewBar_.SetPlaying(false);
+            previewSeekWarmupNeeded_ = false;
+            MessageBoxW(hwnd_, L"\u89C6\u9891\u9884\u89C8\u5931\u8D25", L"SnapPin", MB_ICONERROR);
+        }
+        return 0;
+    case WMU_PREVIEW_EXPORT_DONE: {
+        auto payload = WindowMessagePayload::Take<PreviewExportDonePayload>(lParam);
+        previewExporting_ = false;
+        if (!payload) {
+            return 0;
+        }
+        if (payload->success) {
+            ExitRecordingPreviewMode(true);
+            Finish(OverlayAction::Cancel);
+        } else {
+            const std::wstring message = payload->errorMessage.empty()
+                ? L"\u5BFC\u51FA\u5931\u8D25"
+                : payload->errorMessage;
+            MessageBoxW(hwnd_, message.c_str(), L"SnapPin", MB_ICONERROR);
+        }
+        return 0;
+    }
     case WM_CTLCOLOREDIT:
         if (reinterpret_cast<HWND>(lParam) == textEdit_) {
             HDC hdc = reinterpret_cast<HDC>(wParam);
@@ -1115,10 +1266,8 @@ LRESULT OverlayWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return DefWindowProcW(hwnd_, msg, wParam, lParam);
     case WM_DESTROY:
-        if (longCaptureTimer_ != 0) {
-            KillTimer(hwnd_, longCaptureTimer_);
-            longCaptureTimer_ = 0;
-        }
+        StopOverlayTimers();
+        DestroyPreviewHostWindow();
         DestroyHudWindows();
         DestroyTextEditControl();
         textEditing_ = false;
@@ -1494,6 +1643,41 @@ void OverlayWindow::RefreshFollowHudFromLastMouse() {
     }
 }
 
+void OverlayWindow::ClearFollowHud() {
+    lastInfoRect_.reset();
+    lastMagnifierRect_.reset();
+    lastVerticalGuideRect_.reset();
+    lastHorizontalGuideRect_.reset();
+    UpdateHudWindows(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+}
+
+void OverlayWindow::RefreshToolbarPlacement(bool forceRedraw) {
+    if (stage_ != Stage::Annotating || !HasSelection()) {
+        toolbar_.Hide();
+        previewBar_.Hide();
+        if (previewVideoHostHwnd_) {
+            ShowWindow(previewVideoHostHwnd_, SW_HIDE);
+        }
+        return;
+    }
+    if (recordingPreviewMode_) {
+        toolbar_.Hide();
+        RefreshPreviewPlacement();
+        if (forceRedraw && previewBar_.Hwnd()) {
+            RedrawWindow(previewBar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_NOERASE);
+        }
+        return;
+    }
+    previewBar_.Hide();
+    if (previewVideoHostHwnd_) {
+        ShowWindow(previewVideoHostHwnd_, SW_HIDE);
+    }
+    toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
+    if (forceRedraw && toolbar_.Hwnd()) {
+        RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_NOERASE);
+    }
+}
+
 void OverlayWindow::DrawMagnifierPanel(Gdiplus::Graphics& g, const RECT& panelRect, POINT centerPt, float dpiScale) const {
     if (!capture_.image.IsValid()) {
         return;
@@ -1686,15 +1870,15 @@ void OverlayWindow::DrawCursorInfoPanel(Gdiplus::Graphics& g, const RECT& panelR
     Gdiplus::RectF colorTextRect(textX, row2.Y, std::min(colorSlotW, std::max(0.0f, row2.GetRight() - textX)), row2.Height);
     g.DrawString(colorLine.c_str(), -1, &titleFont, colorTextRect, &leftFmt, &white);
 
-    g.DrawString(L"C: 复制颜色值", -1, &textFont, rowRect(2), &centerFmt, &gray);
-    g.DrawString(L"Alt: 切换颜色格式", -1, &textFont, rowRect(3), &centerFmt, &gray);
+    g.DrawString(L"C: \u590D\u5236\u989C\u8272\u503C", -1, &textFont, rowRect(2), &centerFmt, &gray);
+    g.DrawString(L"Alt: \u5207\u6362\u989C\u8272\u683C\u5F0F", -1, &textFont, rowRect(3), &centerFmt, &gray);
     g.SetTextRenderingHint(oldTextHint);
 }
 
 void OverlayWindow::DrawEditingShortcutHint(Gdiplus::Graphics& g, float dpiScale, const RECT& selectionRect) const {
     const bool selectionTransforming =
         dragMode_ == DragMode::MoveSelection || dragMode_ == DragMode::ResizeSelection;
-    if (stage_ != Stage::Annotating || longCaptureMode_ || whiteboardMode_ || !HasSelection() || selectionTransforming) {
+    if (stage_ != Stage::Annotating || longCaptureMode_ || whiteboardMode_ || screenRecordingMode_ || !HasSelection() || selectionTransforming) {
         return;
     }
 
@@ -1719,17 +1903,16 @@ void OverlayWindow::DrawEditingShortcutHint(Gdiplus::Graphics& g, float dpiScale
         const wchar_t* desc;
     };
     static constexpr ShortcutHintItem kItems[] = {
-        {L"Esc", L"退出截图"},
-        {L"中键", L"固定贴图"},
-        {L"右键", L"重选/撤销"},
-        {L"Tab", L"开/关放大镜和像素信息"},
-        {L"Shift+移动鼠标", L"缓慢移动光标"},
-        {L"Ctrl+Z", L"撤销"},
-        {L"Ctrl+Y", L"重做"},
-        {L"Enter", L"复制"},
-        {L"Space", L"保存"},
-        {L"Ctrl+C", L"复制并退出"},
-        {L"Ctrl+S", L"保存并退出"},
+        {L"Esc", L"\u9000\u51FA\u622A\u56FE"},
+        {L"\u9F20\u6807\u4E2D\u952E", L"\u56FA\u5B9A\u8D34\u56FE"},
+        {L"\u9F20\u6807\u53F3\u952E", L"\u91CD\u9009\u622A\u56FE\u533A\u57DF"},
+        {L"Tab", L"\u663E\u793A\u002F\u9690\u85CF\u8F85\u52A9\u4FE1\u606F\u6846"},
+        {L"\u6309\u4F4F\u0053\u0068\u0069\u0066\u0074", L"\u7F13\u6162\u79FB\u52A8\u5149\u6807"},
+        {L"Ctrl+Z", L"\u64A4\u9500"},
+        {L"Ctrl+Y", L"\u91CD\u505A"},
+        {L"Space", L"\u5B8C\u6210\u622A\u56FE"},
+        {L"Ctrl+C", L"\u590D\u5236\u5230\u526A\u8D34\u677F"},
+        {L"Ctrl+S", L"\u4FDD\u5B58\u4E3A\u6587\u4EF6"},
     };
     constexpr int kLineCount = static_cast<int>(std::size(kItems));
 
@@ -1893,7 +2076,7 @@ void OverlayWindow::DrawCurrentShapePreview(Gdiplus::Graphics& g, const RECT& se
         DrawMosaicRegion(g, captureBitmap_.get(), rr, std::max(4, static_cast<int>(s.stroke * 3.0f)));
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        // 使用固定的笔宽度绘制边框，不受马赛克大小(stroke)的影响
+        // 浣跨敤鍥哄畾鐨勭瑪瀹藉害缁樺埗杈规锛屼笉鍙楅┈璧涘厠澶у皬(stroke)鐨勫奖鍝?
         Gdiplus::Pen mosaicBorderPen(previewColor, 2.0f);
         mosaicBorderPen.SetDashStyle(Gdiplus::DashStyleDash);
         g.DrawRectangle(&mosaicBorderPen, ToGdiRect(rr));
@@ -2101,7 +2284,7 @@ void OverlayWindow::OnPaint() {
 
     HDC paintDc = memDc ? memDc : hdc;
     if (paintDc == memDc) {
-        const COLORREF bgColor = longCaptureMode_ ? kLongCaptureColorKey : RGB(0, 0, 0);
+        const COLORREF bgColor = (longCaptureMode_ || screenRecordingMode_ || recordingPreviewMode_) ? kLongCaptureColorKey : RGB(0, 0, 0);
         HBRUSH bg = CreateSolidBrush(bgColor);
         FillRect(paintDc, &paintRect, bg);
         DeleteObject(bg);
@@ -2151,6 +2334,64 @@ void OverlayWindow::OnPaint() {
         return;
     }
 
+    if (recordingPreviewMode_) {
+        ClearFollowHud();
+        if (paintDc != memDc) {
+            HBRUSH bg = CreateSolidBrush(kLongCaptureColorKey);
+            FillRect(paintDc, &paintRect, bg);
+            DeleteObject(bg);
+        }
+        if (HasSelection()) {
+            RECT sr = SelectionRectNormalized();
+            Gdiplus::Pen border(Gdiplus::Color(255, 95, 170, 240), std::max(1.8f, 2.2f * dpiScale));
+            border.SetAlignment(Gdiplus::PenAlignmentInset);
+            g.DrawRectangle(&border, ToGdiRect(sr));
+        }
+
+        if (paintDc == memDc) {
+            BitBlt(hdc,
+                paintRect.left, paintRect.top, RectWidth(paintRect), RectHeight(paintRect),
+                memDc, 0, 0, SRCCOPY);
+            SetViewportOrgEx(memDc, 0, 0, nullptr);
+        }
+        if (oldObj) {
+            SelectObject(memDc, oldObj);
+        }
+        EndPaint(hwnd_, &ps);
+        return;
+    }
+
+    if (screenRecordingMode_) {
+        if (paintDc != memDc) {
+            HBRUSH bg = CreateSolidBrush(kLongCaptureColorKey);
+            FillRect(paintDc, &paintRect, bg);
+            DeleteObject(bg);
+        }
+
+        ClearFollowHud();
+        if (HasSelection()) {
+            RECT sr = SelectionRectNormalized();
+            const Gdiplus::Color borderColor = recordingPaused_
+                ? Gdiplus::Color(255, 255, 214, 10)
+                : (recordingActive_ ? Gdiplus::Color(255, 232, 70, 70) : Gdiplus::Color(255, 0, 204, 255));
+            Gdiplus::Pen outerBorder(borderColor, std::max(1.8f, 2.2f * dpiScale));
+            outerBorder.SetAlignment(Gdiplus::PenAlignmentInset);
+            g.DrawRectangle(&outerBorder, ToGdiRect(sr));
+        }
+
+        if (paintDc == memDc) {
+            BitBlt(hdc,
+                paintRect.left, paintRect.top, RectWidth(paintRect), RectHeight(paintRect),
+                memDc, 0, 0, SRCCOPY);
+            SetViewportOrgEx(memDc, 0, 0, nullptr);
+        }
+        if (oldObj) {
+            SelectObject(memDc, oldObj);
+        }
+        EndPaint(hwnd_, &ps);
+        return;
+    }
+
     const bool fastSelectionDrag =
         !whiteboardMode_ &&
         (dragMode_ == DragMode::SelectingNew || dragMode_ == DragMode::MoveSelection || dragMode_ == DragMode::ResizeSelection);
@@ -2176,7 +2417,6 @@ void OverlayWindow::OnPaint() {
             Gdiplus::Pen border(Gdiplus::Color(255, 0, 204, 255), 1.5f);
             border.SetAlignment(Gdiplus::PenAlignmentInset);
             g.DrawRectangle(&border, ToGdiRect(sr));
-
 
             if (stage_ == Stage::Annotating) {
                 DrawCommittedShapesInSelection(g, sr, dpiScale, true);
@@ -2281,6 +2521,9 @@ void OverlayWindow::OnMouseDown(POINT p) {
     if (longCaptureMode_) {
         return;
     }
+    if (screenRecordingMode_ && (recordingActive_ || recordingStartPending_)) {
+        return;
+    }
     SetCapture(hwnd_);
     dragStart_ = p;
     lastMouse_ = p;
@@ -2289,11 +2532,14 @@ void OverlayWindow::OnMouseDown(POINT p) {
     precisionLastRaw_ = p;
     precisionMouseX_ = static_cast<double>(p.x);
     precisionMouseY_ = static_cast<double>(p.y);
+    if (recordingPreviewMode_) {
+        ClearFollowHud();
+    }
     initialSelection_ = selection_;
 
     const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     const float dpiScale = DpiScaleForLocalPoint(p);
-    if (stage_ == Stage::Annotating && HasSelection()) {
+    if (stage_ == Stage::Annotating && HasSelection() && !screenRecordingMode_ && !recordingPreviewMode_) {
         cursorInfoEnabled_ = true;
     }
 
@@ -2323,8 +2569,6 @@ void OverlayWindow::OnMouseDown(POINT p) {
             activeHit_ = hit;
             dragMode_ = DragMode::ResizeSelection;
             toolbar_.Hide();
-            // The lower-left shortcut hint sits outside the incremental selection dirty region.
-            // Force one full repaint when transform starts so the stale hint is cleared immediately.
             InvalidateRect(hwnd_, nullptr, FALSE);
             UpdateCursorVisual(p);
             return;
@@ -2332,18 +2576,33 @@ void OverlayWindow::OnMouseDown(POINT p) {
 
         if (hit == HitKind::Inside) {
             const int borderGrab = std::max(6, static_cast<int>(std::round(kSelectionBorderGrab * dpiScale)));
-            const bool shouldMove = ctrl || IsNearRectBorder(sr, p, borderGrab);
+            const bool shouldMove = screenRecordingMode_
+                ? IsNearRectBorder(sr, p, borderGrab)
+                : (recordingPreviewMode_ ? true : (ctrl || IsNearRectBorder(sr, p, borderGrab)));
             if (shouldMove) {
                 activeHit_ = HitKind::Inside;
                 dragMode_ = DragMode::MoveSelection;
                 toolbar_.Hide();
-                // The lower-left shortcut hint sits outside the incremental selection dirty region.
-                // Force one full repaint when transform starts so the stale hint is cleared immediately.
                 InvalidateRect(hwnd_, nullptr, FALSE);
                 UpdateCursorVisual(p);
                 return;
             }
         }
+    }
+
+    if (recordingPreviewMode_) {
+        if (dragMode_ == DragMode::MoveSelection || dragMode_ == DragMode::ResizeSelection) {
+            return;
+        }
+        ReleaseCapture();
+        dragMode_ = DragMode::None;
+        return;
+    }
+
+    if (screenRecordingMode_) {
+        ReleaseCapture();
+        dragMode_ = DragMode::None;
+        return;
     }
 
     if (tool_ == ToolType::Eraser) {
@@ -2453,10 +2712,7 @@ void OverlayWindow::OnMouseMove(POINT p, WPARAM keys) {
         }
     } else if (toolbarHiddenByShiftPrecision_) {
         if (stage_ == Stage::Annotating && HasSelection()) {
-            toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
-            if (toolbar_.Hwnd()) {
-                RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-            }
+            RefreshToolbarPlacement();
         }
         toolbarHiddenByShiftPrecision_ = false;
     }
@@ -2569,6 +2825,10 @@ void OverlayWindow::OnMouseMove(POINT p, WPARAM keys) {
     }
     if (stage_ == Stage::Annotating && dragMode_ == DragMode::None) {
         UpdateCursorVisual(virtualPoint);
+        if (recordingPreviewMode_) {
+            ClearFollowHud();
+            return;
+        }
         if (IsCursorFollowUiActiveAt(virtualPoint)) {
             std::optional<RECT> infoRect;
             std::optional<RECT> magnifierRect;
@@ -2603,10 +2863,7 @@ void OverlayWindow::OnMouseMove(POINT p, WPARAM keys) {
         dragMode_ = DragMode::None;
         ReleaseCapture();
         if (restoreToolbar) {
-            toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
-            if (toolbar_.Hwnd()) {
-                RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-            }
+            RefreshToolbarPlacement();
         }
         UpdateCursorVisual(p);
         return;
@@ -2654,12 +2911,15 @@ void OverlayWindow::OnMouseMove(POINT p, WPARAM keys) {
         };
         appendRect(before);
         appendRect(after);
-        if (!whiteboardMode_) {
+        if (!whiteboardMode_ && !screenRecordingMode_ && !recordingPreviewMode_) {
             appendSelectionInfo(before);
             appendSelectionInfo(after);
         }
         if (hasDirty) {
-            InflateRect(&dirty, 16, 16);
+            const int dirtyPad = recordingPreviewMode_
+                ? std::max(4, static_cast<int>(std::round(4.0f * dpiScale)))
+                : 16;
+            InflateRect(&dirty, dirtyPad, dirtyPad);
             InvalidateRect(hwnd_, &dirty, FALSE);
         } else {
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2697,10 +2957,12 @@ void OverlayWindow::OnMouseMove(POINT p, WPARAM keys) {
     if (dragMode_ == DragMode::MoveSelection) {
         RECT prevSelection = selection_;
         MoveRectBy(selection_, dx, dy);
-        ClampSelectionToBounds();
+        if (!recordingPreviewMode_) {
+            ClampSelectionToBounds();
+        }
         const int appliedDx = selection_.left - prevSelection.left;
         const int appliedDy = selection_.top - prevSelection.top;
-        if (appliedDx != 0 || appliedDy != 0) {
+        if ((appliedDx != 0 || appliedDy != 0) && !recordingPreviewMode_) {
             for (auto& s : shapes_) {
                 MoveShape(s, appliedDx, appliedDy);
             }
@@ -2710,6 +2972,9 @@ void OverlayWindow::OnMouseMove(POINT p, WPARAM keys) {
         }
         dragStart_ = p;
         UpdateCursorVisual(p);
+        if (recordingPreviewMode_) {
+            RefreshPreviewPlacement();
+        }
         invalidateSelectionDelta(oldSelection, selection_);
         return;
     }
@@ -2736,8 +3001,13 @@ void OverlayWindow::OnMouseMove(POINT p, WPARAM keys) {
             selection_ = n;
         }
 
-        ClampSelectionToBounds();
+        if (!recordingPreviewMode_) {
+            ClampSelectionToBounds();
+        }
         UpdateCursorVisual(p);
+        if (recordingPreviewMode_) {
+            RefreshPreviewPlacement();
+        }
         invalidateSelectionDelta(oldSelection, selection_);
         return;
     }
@@ -2841,7 +3111,9 @@ void OverlayWindow::OnMouseUp(POINT p) {
         (dragMode_ == DragMode::SelectingNew || dragMode_ == DragMode::MoveSelection || dragMode_ == DragMode::ResizeSelection);
 
     if (endedSelectionDrag) {
-        ClampSelectionToBounds();
+        if (!recordingPreviewMode_) {
+            ClampSelectionToBounds();
+        }
         RECT sr = SelectionRectNormalized();
         if (stage_ == Stage::Selecting && dragMode_ == DragMode::SelectingNew) {
             if ((RectWidth(sr) < kMinSelection || RectHeight(sr) < kMinSelection) && hoverWindowRect_.has_value()) {
@@ -2853,18 +3125,11 @@ void OverlayWindow::OnMouseUp(POINT p) {
             if (stage_ == Stage::Selecting) {
                 stage_ = Stage::Annotating;
             }
-            toolbar_.ShowNear(sr, RECT{0, 0, capture_.image.width, capture_.image.height});
-            if (toolbar_.Hwnd()) {
-                RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_NOERASE);
-            }
-            cursorInfoEnabled_ = !whiteboardMode_;
-            if (whiteboardMode_) {
+            RefreshToolbarPlacement(false);
+            cursorInfoEnabled_ = !whiteboardMode_ && !screenRecordingMode_;
+            if (whiteboardMode_ || screenRecordingMode_) {
                 followHudEnabled_ = false;
-                lastInfoRect_.reset();
-                lastMagnifierRect_.reset();
-                lastVerticalGuideRect_.reset();
-                lastHorizontalGuideRect_.reset();
-                UpdateHudWindows(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+                ClearFollowHud();
             } else {
                 RefreshFollowHudFromLastMouse();
             }
@@ -2880,16 +3145,32 @@ void OverlayWindow::OnMouseUp(POINT p) {
     activeHit_ = HitKind::None;
     activeShapeHit_ = HitKind::None;
     ReleaseCapture();
-    UpdateCursorVisual(p);
+    if (recordingPreviewMode_) {
+        ClearFollowHud();
+    }
+    if (recordingPreviewMode_) {
+        RECT sr = SelectionRectNormalized();
+        if (PtInRect(&sr, p)) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+        } else {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        }
+    } else {
+        UpdateCursorVisual(p);
+    }
     if (endedSelectionDrag) {
-        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        if (recordingPreviewMode_) {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        } else {
+            RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        }
     } else {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
 
 void OverlayWindow::OnRightClick(POINT) {
-    if (longCaptureMode_) {
+    if (longCaptureMode_ || screenRecordingMode_ || recordingPreviewMode_) {
         Finish(OverlayAction::Cancel);
         return;
     }
@@ -2941,7 +3222,7 @@ void OverlayWindow::OnRightClick(POINT) {
 }
 
 void OverlayWindow::OnMiddleClick(POINT p) {
-    if (longCaptureMode_) {
+    if (longCaptureMode_ || screenRecordingMode_ || recordingPreviewMode_) {
         return;
     }
     lastMouse_ = p;
@@ -2968,11 +3249,14 @@ void OverlayWindow::OnMiddleClick(POINT p) {
 }
 
 void OverlayWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
+    if (recordingPreviewMode_) {
+        return;
+    }
     const bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     const bool firstPress = (lParam & (1 << 30)) == 0;
 
-    if (vk == VK_TAB && firstPress && HasSelection() && !longCaptureMode_ && !whiteboardMode_) {
+    if (vk == VK_TAB && firstPress && HasSelection() && !longCaptureMode_ && !whiteboardMode_ && !screenRecordingMode_) {
         followHudEnabled_ = !followHudEnabled_;
         RefreshFollowHudFromLastMouse();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2996,6 +3280,22 @@ void OverlayWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
 
     if (whiteboardMode_ && vk == VK_ESCAPE) {
         Finish(OverlayAction::Cancel);
+        return;
+    }
+
+    if (screenRecordingMode_ && vk == VK_ESCAPE) {
+        HWND target = GetForegroundWindow();
+        if (!target || target == hwnd_ || (toolbar_.Hwnd() && (target == toolbar_.Hwnd() || IsChild(toolbar_.Hwnd(), target)))) {
+            target = preRecordingForegroundHwnd_;
+        }
+        if (target && target != hwnd_ && !(toolbar_.Hwnd() && (target == toolbar_.Hwnd() || IsChild(toolbar_.Hwnd(), target)))) {
+            PostMessageW(target, WM_KEYDOWN, VK_ESCAPE, lParam);
+            PostMessageW(target, WM_KEYUP, VK_ESCAPE, (lParam & 0x7FFF0000) | 0xC0000001);
+        }
+        return;
+    }
+
+    if (screenRecordingMode_ && ctrlDown) {
         return;
     }
 
@@ -3030,6 +3330,9 @@ void OverlayWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
     }
 
     if (vk == VK_ESCAPE) {
+        if (screenRecordingMode_) {
+            return;
+        }
         const bool inEditingSession = stage_ == Stage::Annotating && HasSelection() &&
             (tool_ != ToolType::None || selectedShape_ >= 0 || hasCurrentShape_ || textEditing_ ||
                 dragMode_ == DragMode::DrawShape || dragMode_ == DragMode::MoveShape || dragMode_ == DragMode::ResizeShape);
@@ -3042,12 +3345,13 @@ void OverlayWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
         return;
     }
 
-    if (vk == VK_RETURN) {
-        Finish(OverlayAction::Copy);
-        return;
-    }
+
+
 
     if (vk == VK_SPACE) {
+        if (screenRecordingMode_) {
+            return;
+        }
         if (HasSelection()) {
             Finish(OverlayAction::QuickSave);
         }
@@ -3096,14 +3400,191 @@ void OverlayWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
 }
 
 void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
+    auto isButtonClickNotify = [](UINT code) {
+        return code == BN_CLICKED || code == BN_DOUBLECLICKED;
+    };
     auto restoreOverlayFocus = [&]() {
+        if (screenRecordingMode_) {
+            if (preRecordingForegroundHwnd_ && IsWindow(preRecordingForegroundHwnd_)) {
+                SetForegroundWindow(preRecordingForegroundHwnd_);
+            }
+            return;
+        }
+        if (recordingPreviewMode_) {
+            return;
+        }
         if (hwnd_ && IsWindow(hwnd_) && GetFocus() != hwnd_) {
             SetFocus(hwnd_);
         }
     };
 
+    if (recordingPreviewMode_) {
+        switch (id) {
+        case ID_TOOL_PREVIEW_SPEED:
+            if (notifyCode == CBN_SELCHANGE && previewPlayer_) {
+                previewPlayer_->SetRate(previewBar_.PlaybackRate());
+            }
+            return;
+        case ID_TOOL_PREVIEW_EXPORT_QUALITY:
+            return;
+        case ID_TOOL_PREVIEW_PROGRESS:
+            if (previewPlayer_) {
+                const LONGLONG targetPosition = previewBar_.SliderSeekPosition100ns();
+                auto seekPreviewAt = [&](LONGLONG pos) {
+                    if (previewSeekWarmupNeeded_) {
+                        previewPlayer_->PrimeFirstFrame(pos);
+                        previewSeekWarmupNeeded_ = false;
+                    } else {
+                        previewPlayer_->SeekPreviewFrame(pos);
+                    }
+                };
+                if (previewBar_.IsSliderTracking()) {
+                    if (!previewSeekTracking_) {
+                        previewSeekTracking_ = true;
+                        previewSeekResumeAfterRelease_ = previewPlayer_->IsPlaying();
+                        if (previewSeekResumeAfterRelease_) {
+                            previewPlayer_->Pause();
+                        }
+                    }
+                    seekPreviewAt(targetPosition);
+                    const LONGLONG duration = previewPlayer_->Duration100ns();
+                    previewBar_.SetPreviewMetrics(duration, targetPosition);
+                    if (duration > 0 && targetPosition < duration - 200000) {
+                        previewSeekWarmupNeeded_ = false;
+                    }
+                    previewBar_.SetPlaying(false);
+                    return;
+                }
+
+                seekPreviewAt(targetPosition);
+                const LONGLONG duration = previewPlayer_->Duration100ns();
+                previewBar_.SetPreviewMetrics(duration, targetPosition);
+                if (duration > 0 && targetPosition < duration - 200000) {
+                    previewSeekWarmupNeeded_ = false;
+                }
+
+                if (previewSeekTracking_) {
+                    const bool shouldResume = previewSeekResumeAfterRelease_;
+                    previewSeekTracking_ = false;
+                    previewSeekResumeAfterRelease_ = false;
+                    if (shouldResume) {
+                        previewPlayer_->Play();
+                    }
+                }
+                previewBar_.SetPlaying(previewPlayer_->IsPlaying());
+            }
+            return;
+        case ID_TOOL_PREVIEW_PLAY_PAUSE:
+            if (!isButtonClickNotify(notifyCode) || !previewPlayer_) {
+                return;
+            }
+            {
+                const bool wasPlaying = previewPlayer_->IsPlaying();
+                if (!wasPlaying) {
+                    const LONGLONG duration = previewPlayer_->Duration100ns();
+                    const LONGLONG position = previewPlayer_->Position100ns();
+                    if (duration > 0 && position >= duration - 200000) {
+                        previewPlayer_->SeekToTime(0);
+                    }
+                }
+                previewPlayer_->TogglePlayPause();
+                previewBar_.SetPlaying(!wasPlaying);
+                previewSeekWarmupNeeded_ = false;
+                if (wasPlaying) {
+                    const LONGLONG duration = previewPlayer_->Duration100ns();
+                    const LONGLONG position = previewPlayer_->Position100ns();
+                    previewBar_.SetPreviewMetrics(duration, position);
+                }
+            }
+            return;
+        case ID_TOOL_PREVIEW_RERECORD:
+            if (!isButtonClickNotify(notifyCode)) {
+                return;
+            }
+            if (previewExporting_) {
+                MessageBoxW(hwnd_, L"\u6B63\u5728\u5BFC\u51FA\u89C6\u9891\uff0c\u8BF7\u7A0D\u5019\u518D\u8BD5\u3002", L"SnapPin", MB_ICONINFORMATION);
+                return;
+            }
+            ExitRecordingPreviewMode(true);
+            EnterScreenRecordingMode();
+            return;
+        case ID_TOOL_PREVIEW_EXPORT:
+            if (!isButtonClickNotify(notifyCode)) {
+                return;
+            }
+            if (previewExporting_) {
+                MessageBoxW(hwnd_, L"\u6B63\u5728\u5BFC\u51FA\u89C6\u9891\uff0c\u8BF7\u7A0D\u5019\u3002", L"SnapPin", MB_ICONINFORMATION);
+                return;
+            }
+            if (recordingTempPath_.empty()) {
+                MessageBoxW(hwnd_, L"No recording file available.", L"SnapPin", MB_ICONWARNING);
+                return;
+            }
+            {
+                std::filesystem::path defaultPath = recordingTempPath_;
+                defaultPath = defaultPath.parent_path() / (defaultPath.stem().wstring() + L"_export.mp4");
+                std::wstring initialDir = defaultPath.parent_path().wstring();
+                std::wstring defaultName = defaultPath.filename().wstring();
+                wchar_t pathBuf[MAX_PATH]{};
+                wcsncpy_s(pathBuf, _countof(pathBuf), defaultName.c_str(), _TRUNCATE);
+
+                OPENFILENAMEW ofn{};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hwnd_;
+                ofn.lpstrFilter = L"MP4 Video (*.mp4)\0*.mp4\0\0";
+                ofn.lpstrFile = pathBuf;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrInitialDir = initialDir.c_str();
+                ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+                ofn.lpstrDefExt = L"mp4";
+                if (!GetSaveFileNameW(&ofn)) {
+                    return;
+                }
+
+                const std::filesystem::path inputPath = recordingTempPath_;
+                const std::filesystem::path outputPath = std::filesystem::path(pathBuf);
+                const VideoExportQuality quality = previewBar_.ExportQuality();
+                const HWND notifyHwnd = hwnd_;
+                previewExporting_ = true;
+                std::thread([notifyHwnd, inputPath, outputPath, quality]() {
+                    auto payload = std::make_unique<PreviewExportDonePayload>();
+                    payload->outputPath = outputPath.wstring();
+                    try {
+                        payload->success = ScreenRecorder::ExportRecording(inputPath, outputPath, quality, payload->errorMessage);
+                    } catch (const std::exception& ex) {
+                        payload->success = false;
+                        payload->errorMessage = L"Export failed: " + Utf8ToWide(ex.what());
+                        Logger::Instance().Error(payload->errorMessage);
+                    } catch (...) {
+                        payload->success = false;
+                        payload->errorMessage = L"Export failed: unknown exception.";
+                        Logger::Instance().Error(payload->errorMessage);
+                    }
+                    if (!WindowMessagePayload::Post(notifyHwnd, WMU_PREVIEW_EXPORT_DONE, 0, std::move(payload))) {
+                        Logger::Instance().Error(L"Preview export result dispatch failed.");
+                    }
+                }).detach();
+            }
+            return;
+        case ID_TOOL_PREVIEW_CLOSE:
+            if (!isButtonClickNotify(notifyCode)) {
+                return;
+            }
+            if (previewExporting_) {
+                MessageBoxW(hwnd_, L"\u6B63\u5728\u5BFC\u51FA\u89C6\u9891\uff0c\u8BF7\u7A0D\u5019\u518D\u5173\u95ED\u3002", L"SnapPin", MB_ICONINFORMATION);
+                return;
+            }
+            ExitRecordingPreviewMode(true);
+            Finish(OverlayAction::Cancel);
+            return;
+        default:
+            return;
+        }
+    }
+
     auto isComboControl = [](UINT cid) {
-        return cid == ID_TOOL_STROKE_WIDTH || cid == ID_TOOL_TEXT_SIZE || cid == ID_TOOL_TEXT_STYLE;
+        return cid == ID_TOOL_STROKE_WIDTH || cid == ID_TOOL_TEXT_SIZE || cid == ID_TOOL_TEXT_STYLE ||
+            cid == ID_TOOL_RECORD_DELAY || cid == ID_TOOL_RECORD_FPS;
     };
     auto isStyleControl = [](UINT cid) {
         return cid == ID_TOOL_STROKE_COLOR || cid == ID_TOOL_FILL_ENABLE ||
@@ -3120,15 +3601,19 @@ void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
         case ID_TOOL_LONG_CAPTURE:
         case ID_TOOL_OCR:
         case ID_TOOL_WHITEBOARD:
+        case ID_TOOL_SCREEN_RECORD:
         case ID_TOOL_TRIM_ABOVE:
         case ID_TOOL_TRIM_BELOW:
+        case ID_TOOL_RECORD_TOGGLE:
+        case ID_TOOL_RECORD_PAUSE:
+        case ID_TOOL_RECORD_SYSTEM_AUDIO:
+        case ID_TOOL_RECORD_MIC_AUDIO:
         case ID_TOOL_CANCEL:
             return true;
         default:
             return false;
         }
     };
-
     const bool modeButton = toolbar_.IsModeButtonId(id);
     const bool comboControl = isComboControl(id);
     const bool styleControl = isStyleControl(id);
@@ -3151,6 +3636,19 @@ void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
             return;
         }
     }
+    if (screenRecordingMode_) {
+        const bool allowedInRecording =
+            id == ID_TOOL_RECORD_DELAY ||
+            id == ID_TOOL_RECORD_FPS ||
+            id == ID_TOOL_RECORD_TOGGLE ||
+            id == ID_TOOL_RECORD_PAUSE ||
+            id == ID_TOOL_RECORD_SYSTEM_AUDIO ||
+            id == ID_TOOL_RECORD_MIC_AUDIO ||
+            id == ID_TOOL_CANCEL;
+        if (!allowedInRecording) {
+            return;
+        }
+    }
 
     if (comboControl) {
         if (notifyCode == CBN_DROPDOWN) {
@@ -3163,7 +3661,7 @@ void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
         if (notifyCode != CBN_SELCHANGE) {
             return;
         }
-    } else if (notifyCode != BN_CLICKED) {
+    } else if (!isButtonClickNotify(notifyCode)) {
         return;
     }
 
@@ -3189,10 +3687,7 @@ void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
         toolbar_.SetActiveTool(tool_);
         ApplyToolbarStyle();
         if (HasSelection()) {
-            toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
-            if (toolbar_.Hwnd()) {
-                RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-            }
+            RefreshToolbarPlacement();
         }
         MarkSceneDirty();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -3200,27 +3695,13 @@ void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
         return;
     }
 
-    if (id == ID_TOOL_STROKE_WIDTH) {
+    if (id == ID_TOOL_STROKE_WIDTH || id == ID_TOOL_FILL_ENABLE || id == ID_TOOL_TEXT_SIZE || id == ID_TOOL_TEXT_STYLE) {
         ApplyToolbarStyle();
         InvalidateRect(hwnd_, nullptr, FALSE);
         restoreOverlayFocus();
         return;
     }
-    if (id == ID_TOOL_FILL_ENABLE) {
-        ApplyToolbarStyle();
-        InvalidateRect(hwnd_, nullptr, FALSE);
-        restoreOverlayFocus();
-        return;
-    }
-    if (id == ID_TOOL_TEXT_SIZE) {
-        ApplyToolbarStyle();
-        InvalidateRect(hwnd_, nullptr, FALSE);
-        restoreOverlayFocus();
-        return;
-    }
-    if (id == ID_TOOL_TEXT_STYLE) {
-        ApplyToolbarStyle();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+    if (id == ID_TOOL_RECORD_DELAY || id == ID_TOOL_RECORD_FPS) {
         restoreOverlayFocus();
         return;
     }
@@ -3249,10 +3730,7 @@ void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
         return;
     }
 
-    if (textEditing_ &&
-        id != ID_TOOL_TEXT_SIZE &&
-        id != ID_TOOL_TEXT_STYLE &&
-        id != ID_TOOL_TEXT_COLOR) {
+    if (textEditing_ && id != ID_TOOL_TEXT_SIZE && id != ID_TOOL_TEXT_STYLE && id != ID_TOOL_TEXT_COLOR) {
         EndTextEdit(true);
     }
 
@@ -3318,8 +3796,53 @@ void OverlayWindow::OnToolbarCommand(UINT id, UINT notifyCode) {
     case ID_TOOL_WHITEBOARD:
         EnterWhiteboardMode();
         break;
-    case ID_TOOL_CANCEL: Finish(OverlayAction::Cancel); break;
-    default: break;
+    case ID_TOOL_SCREEN_RECORD:
+        EnterScreenRecordingMode();
+        break;
+    case ID_TOOL_RECORD_TOGGLE:
+        if (recordingStartPending_) {
+            StopWindowTimer(recordingStartTimer_);
+            recordingStartPending_ = false;
+            toolbar_.SetRecordingState(false, false);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            restoreOverlayFocus();
+            return;
+        }
+        if (recordingActive_) {
+            StopScreenRecording(true);
+            return;
+        }
+        {
+            const int delayMs = toolbar_.RecordingDelayMs();
+            if (delayMs > 0) {
+                StopWindowTimer(recordingStartTimer_);
+                recordingStartPending_ = true;
+                recordingStartTimer_ = SetTimer(hwnd_, IDT_RECORDING_START, static_cast<UINT>(delayMs), nullptr);
+            } else {
+                StartScreenRecording();
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            restoreOverlayFocus();
+        }
+        return;
+    case ID_TOOL_RECORD_PAUSE:
+        if (recordingActive_ && screenRecorder_) {
+            recordingPaused_ = !recordingPaused_;
+            screenRecorder_->Pause(recordingPaused_);
+            toolbar_.SetRecordingState(recordingActive_, recordingPaused_);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        restoreOverlayFocus();
+        return;
+    case ID_TOOL_RECORD_SYSTEM_AUDIO:
+    case ID_TOOL_RECORD_MIC_AUDIO:
+        restoreOverlayFocus();
+        return;
+    case ID_TOOL_CANCEL:
+        Finish(OverlayAction::Cancel);
+        break;
+    default:
+        break;
     }
     if (id != ID_TOOL_SAVE && id != ID_TOOL_COPY && id != ID_TOOL_COPY_FILE && id != ID_TOOL_PIN && id != ID_TOOL_OCR && id != ID_TOOL_CANCEL) {
         MarkSceneDirty();
@@ -3358,17 +3881,21 @@ void OverlayWindow::EnterLongCaptureMode() {
 
     longCaptureMode_ = true;
     whiteboardMode_ = false;
+    screenRecordingMode_ = false;
+    recordingPreviewMode_ = false;
+    recordingStartPending_ = false;
+    recordingActive_ = false;
+    recordingPaused_ = false;
     tool_ = ToolType::None;
     toolbar_.SetLongCaptureMode(true);
     toolbar_.SetWhiteboardMode(false);
+    toolbar_.SetScreenRecordingMode(false);
+    toolbar_.SetRecordingState(false, false);
     toolbar_.SetActiveTool(ToolType::None);
     toolbar_.Hide();
     cursorInfoEnabled_ = false;
-    lastInfoRect_.reset();
-    lastMagnifierRect_.reset();
-    lastVerticalGuideRect_.reset();
-    lastHorizontalGuideRect_.reset();
-    UpdateHudWindows(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+    followHudEnabled_ = false;
+    ClearFollowHud();
 
     LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     const LONG_PTR longExFlags = WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_LAYERED;
@@ -3402,21 +3929,15 @@ void OverlayWindow::EnterLongCaptureMode() {
         SetFocus(longCaptureTargetHwnd_);
     }
 
-    if (longCaptureTimer_ != 0) {
-        KillTimer(hwnd_, longCaptureTimer_);
-        longCaptureTimer_ = 0;
-    }
+    StopWindowTimer(longCaptureTimer_);
     longCaptureTimer_ = SetTimer(hwnd_, IDT_LONG_CAPTURE, kLongCaptureTickMs, nullptr);
     MarkSceneDirty();
     RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-    toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
-    if (toolbar_.Hwnd()) {
-        RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_NOERASE);
-    }
+    RefreshToolbarPlacement();
 }
 
 void OverlayWindow::EnterWhiteboardMode() {
-    if (!hwnd_ || longCaptureMode_ || whiteboardMode_ || stage_ != Stage::Annotating || !HasSelection()) {
+    if (!hwnd_ || longCaptureMode_ || whiteboardMode_ || screenRecordingMode_ || stage_ != Stage::Annotating || !HasSelection()) {
         return;
     }
 
@@ -3436,6 +3957,11 @@ void OverlayWindow::EnterWhiteboardMode() {
     nextNumber_ = 1;
 
     whiteboardMode_ = true;
+    screenRecordingMode_ = false;
+    recordingPreviewMode_ = false;
+    recordingStartPending_ = false;
+    recordingActive_ = false;
+    recordingPaused_ = false;
     tool_ = ToolType::None;
     selectedShape_ = -1;
     activeShapeHit_ = HitKind::None;
@@ -3444,23 +3970,386 @@ void OverlayWindow::EnterWhiteboardMode() {
 
     cursorInfoEnabled_ = false;
     followHudEnabled_ = false;
-    lastInfoRect_.reset();
-    lastMagnifierRect_.reset();
-    lastVerticalGuideRect_.reset();
-    lastHorizontalGuideRect_.reset();
-    UpdateHudWindows(std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+    ClearFollowHud();
 
     toolbar_.SetLongCaptureMode(false);
     toolbar_.SetWhiteboardMode(true);
+    toolbar_.SetScreenRecordingMode(false);
+    toolbar_.SetRecordingState(false, false);
     toolbar_.SetActiveTool(tool_);
     ApplyToolbarStyle();
-    toolbar_.ShowNear(SelectionRectNormalized(), RECT{0, 0, capture_.image.width, capture_.image.height});
-    if (toolbar_.Hwnd()) {
-        RedrawWindow(toolbar_.Hwnd(), nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_NOERASE);
-    }
+    RefreshToolbarPlacement();
 
     MarkSceneDirty();
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void OverlayWindow::EnterScreenRecordingMode() {
+    if (!hwnd_ || longCaptureMode_ || whiteboardMode_ || screenRecordingMode_ || recordingPreviewMode_ || stage_ != Stage::Annotating || !HasSelection()) {
+        return;
+    }
+
+    if (textEditing_) {
+        EndTextEdit(true);
+    }
+    if (hasCurrentShape_) {
+        CommitCurrentShape();
+    }
+    dragMode_ = DragMode::None;
+    ReleaseCapture();
+
+    screenRecordingMode_ = true;
+    recordingPreviewMode_ = false;
+    longCaptureMode_ = false;
+    whiteboardMode_ = false;
+    recordingStartPending_ = false;
+    recordingActive_ = false;
+    recordingPaused_ = false;
+    tool_ = ToolType::None;
+    selectedShape_ = -1;
+    activeShapeHit_ = HitKind::None;
+    hasCurrentShape_ = false;
+    currentShape_ = {};
+
+    cursorInfoEnabled_ = false;
+    followHudEnabled_ = false;
+    ClearFollowHud();
+
+    toolbar_.SetLongCaptureMode(false);
+    toolbar_.SetWhiteboardMode(false);
+    toolbar_.SetScreenRecordingMode(true);
+    toolbar_.SetRecordingState(false, false);
+    toolbar_.SetActiveTool(ToolType::None);
+
+    HWND candidate = nullptr;
+    POINT cursorPt{};
+    if (GetCursorPos(&cursorPt)) {
+        HWND hit = WindowFromPoint(cursorPt);
+        if (hit && hit != hwnd_ && !(toolbar_.Hwnd() && (hit == toolbar_.Hwnd() || IsChild(toolbar_.Hwnd(), hit)))) {
+            candidate = GetAncestor(hit, GA_ROOT);
+            if (!candidate) {
+                candidate = hit;
+            }
+        }
+    }
+    if (!candidate) {
+        POINT center{(selection_.left + selection_.right) / 2, (selection_.top + selection_.bottom) / 2};
+        POINT screenCenter = LocalToScreenPoint(center);
+        HWND hit = WindowFromPoint(screenCenter);
+        if (hit && hit != hwnd_ && !(toolbar_.Hwnd() && (hit == toolbar_.Hwnd() || IsChild(toolbar_.Hwnd(), hit)))) {
+            candidate = GetAncestor(hit, GA_ROOT);
+            if (!candidate) {
+                candidate = hit;
+            }
+        }
+    }
+    if (!candidate) {
+        HWND fg = GetForegroundWindow();
+        if (fg && fg != hwnd_ && !(toolbar_.Hwnd() && (fg == toolbar_.Hwnd() || IsChild(toolbar_.Hwnd(), fg)))) {
+            candidate = fg;
+        }
+    }
+    preRecordingForegroundHwnd_ = candidate;
+
+    ApplyRecordingOverlayWindowStyle();
+    RefreshToolbarPlacement();
+    MarkSceneDirty();
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_NOERASE);
+
+    if (preRecordingForegroundHwnd_ && IsWindow(preRecordingForegroundHwnd_)) {
+        SetForegroundWindow(preRecordingForegroundHwnd_);
+    }
+}
+
+bool OverlayWindow::StartScreenRecording() {
+    if (!hwnd_ || !screenRecordingMode_ || !HasSelection()) {
+        return false;
+    }
+    if (recordingActive_) {
+        return true;
+    }
+    if (!screenRecorder_) {
+        screenRecorder_ = std::make_unique<ScreenRecorder>();
+    }
+
+    RECT screenRect = SelectionRectNormalized();
+    OffsetRect(&screenRect, capture_.virtualRect.left, capture_.virtualRect.top);
+    constexpr int kRecordingCaptureInset = 3;
+    if (RectWidth(screenRect) > kRecordingCaptureInset * 2 && RectHeight(screenRect) > kRecordingCaptureInset * 2) {
+        InflateRect(&screenRect, -kRecordingCaptureInset, -kRecordingCaptureInset);
+    }
+
+    std::error_code ec;
+    if (!recordingTempPath_.empty()) {
+        std::filesystem::remove(recordingTempPath_, ec);
+    }
+    recordingTempPath_ = BuildRecordingTempPath();
+
+    ScreenRecordingOptions options{};
+    options.screenRect = screenRect;
+    options.fps = toolbar_.RecordingFps();
+    options.recordSystemAudio = toolbar_.RecordSystemAudioEnabled();
+    options.recordMicrophoneAudio = toolbar_.RecordMicrophoneAudioEnabled();
+    options.outputPath = recordingTempPath_;
+    options.videoBitrate = ScreenRecorder::RecommendedVideoBitrate(RectWidth(screenRect), RectHeight(screenRect), options.fps, VideoExportQuality::Original);
+
+    if (!screenRecorder_->Start(options)) {
+        recordingTempPath_.clear();
+        MessageBoxW(hwnd_, L"Start recording failed.", L"SnapPin", MB_ICONERROR);
+        toolbar_.SetRecordingState(false, false);
+        return false;
+    }
+
+    recordingStartPending_ = false;
+    recordingActive_ = true;
+    recordingPaused_ = false;
+    lastRecordingResult_.reset();
+    toolbar_.SetRecordingState(true, false);
+    ApplyRecordingOverlayWindowStyle();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+
+    if (preRecordingForegroundHwnd_ && IsWindow(preRecordingForegroundHwnd_)) {
+        SetForegroundWindow(preRecordingForegroundHwnd_);
+    }
+    return true;
+}
+
+void OverlayWindow::StopScreenRecording(bool enterPreview) {
+    StopWindowTimer(recordingStartTimer_);
+    if (recordingStartPending_) {
+        recordingStartPending_ = false;
+        toolbar_.SetRecordingState(false, false);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+    if (!recordingActive_ || !screenRecorder_) {
+        return;
+    }
+
+    ScreenRecordingResult result;
+    const bool success = screenRecorder_->Stop(result);
+    recordingActive_ = false;
+    recordingPaused_ = false;
+    toolbar_.SetRecordingState(false, false);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+
+    if (!success) {
+        std::error_code ec;
+        if (!recordingTempPath_.empty()) {
+            std::filesystem::remove(recordingTempPath_, ec);
+        }
+        recordingTempPath_.clear();
+        lastRecordingResult_.reset();
+        MessageBoxW(hwnd_, L"Stop recording failed.", L"SnapPin", MB_ICONERROR);
+        return;
+    }
+
+    lastRecordingResult_ = result;
+    recordingTempPath_ = result.outputPath;
+    if (enterPreview) {
+        EnterRecordingPreviewMode(result);
+    }
+}
+
+void OverlayWindow::EnterRecordingPreviewMode(const ScreenRecordingResult& result) {
+    if (!hwnd_ || !result.success) {
+        return;
+    }
+
+    screenRecordingMode_ = false;
+    recordingPreviewMode_ = true;
+    recordingStartPending_ = false;
+    recordingActive_ = false;
+    recordingPaused_ = false;
+    preRecordingForegroundHwnd_ = nullptr;
+
+    toolbar_.SetScreenRecordingMode(false);
+    toolbar_.SetRecordingState(false, false);
+    toolbar_.Hide();
+
+    cursorInfoEnabled_ = false;
+    followHudEnabled_ = false;
+    ClearFollowHud();
+    previewSeekTracking_ = false;
+    previewSeekResumeAfterRelease_ = false;
+    previewSeekWarmupNeeded_ = false;
+    previewExporting_ = false;
+
+    ApplyPreviewOverlayWindowStyle();
+    EnsurePreviewHostWindow();
+    RefreshPreviewPlacement();
+
+    previewBar_.SetPlaying(false);
+    previewBar_.SetPreviewMetrics(result.duration100ns, 0);
+
+    if (!previewPlayer_) {
+        previewPlayer_ = std::make_unique<VideoPreviewPlayer>(hwnd_);
+    }
+    if (previewPlayer_) {
+        previewPlayer_->Close();
+        std::wstring errorMessage;
+        if (!previewPlayer_->Open(previewVideoHostHwnd_, result.outputPath, errorMessage)) {
+            const std::wstring message = errorMessage.empty() ? L"Open preview failed." : errorMessage;
+            MessageBoxW(hwnd_, message.c_str(), L"SnapPin", MB_ICONERROR);
+        }
+    }
+
+    StopWindowTimer(previewProgressTimer_);
+    previewProgressTimer_ = SetTimer(hwnd_, IDT_PREVIEW_PROGRESS, 33, nullptr);
+
+    MarkSceneDirty();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    RefreshToolbarPlacement();
+}
+
+void OverlayWindow::ExitRecordingPreviewMode(bool discardTempFile) {
+    StopWindowTimer(previewProgressTimer_);
+    if (previewPlayer_) {
+        previewPlayer_->Close();
+    }
+    previewBar_.Hide();
+    DestroyPreviewHostWindow();
+    recordingPreviewMode_ = false;
+    previewSeekTracking_ = false;
+    previewSeekResumeAfterRelease_ = false;
+    previewSeekWarmupNeeded_ = false;
+    previewExporting_ = false;
+
+    if (discardTempFile) {
+        std::error_code ec;
+        if (!recordingTempPath_.empty()) {
+            std::filesystem::remove(recordingTempPath_, ec);
+        }
+        recordingTempPath_.clear();
+    }
+    lastRecordingResult_.reset();
+}
+
+void OverlayWindow::RestoreOverlayWindowStyle() {
+    if (!hwnd_) {
+        return;
+    }
+    const LONG_PTR normalExStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+    if (GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) != normalExStyle) {
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, normalExStyle);
+        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+}
+
+void OverlayWindow::ApplyRecordingOverlayWindowStyle() {
+    if (!hwnd_) {
+        return;
+    }
+    const LONG_PTR recordingExStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    if (GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) != recordingExStyle) {
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, recordingExStyle);
+    }
+    SetLayeredWindowAttributes(hwnd_, kLongCaptureColorKey, 0, LWA_COLORKEY);
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+}
+
+void OverlayWindow::ApplyPreviewOverlayWindowStyle() {
+    if (!hwnd_) {
+        return;
+    }
+    const LONG_PTR previewExStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
+    if (GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) != previewExStyle) {
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, previewExStyle);
+    }
+    SetLayeredWindowAttributes(hwnd_, kLongCaptureColorKey, 0, LWA_COLORKEY);
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+}
+
+void OverlayWindow::EnsurePreviewHostWindow() {
+    if (previewVideoHostHwnd_ || !hwnd_) {
+        return;
+    }
+    previewVideoHostHwnd_ = CreateWindowExW(
+        WS_EX_NOPARENTNOTIFY,
+        L"STATIC",
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | SS_BLACKRECT,
+        0, 0, 0, 0,
+        hwnd_,
+        nullptr,
+        hInstance_,
+        nullptr);
+    if (previewVideoHostHwnd_) {
+        SetWindowSubclass(previewVideoHostHwnd_, PreviewHostSubclassProc, 1, 0);
+    }
+}
+
+void OverlayWindow::DestroyPreviewHostWindow() {
+    if (previewVideoHostHwnd_) {
+        RemoveWindowSubclass(previewVideoHostHwnd_, PreviewHostSubclassProc, 1);
+        DestroyWindow(previewVideoHostHwnd_);
+        previewVideoHostHwnd_ = nullptr;
+    }
+}
+
+void OverlayWindow::RefreshPreviewPlacement() {
+    if (!recordingPreviewMode_ || !HasSelection()) {
+        previewBar_.Hide();
+        if (previewVideoHostHwnd_) {
+            ShowWindow(previewVideoHostHwnd_, SW_HIDE);
+        }
+        return;
+    }
+
+    EnsurePreviewHostWindow();
+    RECT sr = SelectionRectNormalized();
+    RECT hostRect = sr;
+    InflateRect(&hostRect, -2, -2);
+    if (RectWidth(hostRect) < 2 || RectHeight(hostRect) < 2) {
+        hostRect = sr;
+    }
+    if (previewVideoHostHwnd_) {
+        UINT flags = SWP_NOACTIVATE | SWP_NOZORDER;
+        if (!IsWindowVisible(previewVideoHostHwnd_)) {
+            flags |= SWP_SHOWWINDOW;
+        }
+        SetWindowPos(previewVideoHostHwnd_, nullptr,
+            hostRect.left, hostRect.top,
+            std::max(1, RectWidth(hostRect)), std::max(1, RectHeight(hostRect)),
+            flags);
+    }
+    previewBar_.ShowNear(sr, RECT{0, 0, capture_.image.width, capture_.image.height});
+}
+
+void OverlayWindow::UpdateRecordingPreviewProgress() {
+    if (!recordingPreviewMode_) {
+        return;
+    }
+    if (previewBar_.IsSliderTracking()) {
+        return;
+    }
+    const bool isPlaying = previewPlayer_ && previewPlayer_->IsPlaying();
+    previewBar_.SetPlaying(isPlaying);
+    if (!isPlaying) {
+        return;
+    }
+    const LONGLONG duration = previewPlayer_ ? previewPlayer_->Duration100ns() : (lastRecordingResult_.has_value() ? lastRecordingResult_->duration100ns : 0);
+    const LONGLONG position = previewPlayer_ ? previewPlayer_->Position100ns() : 0;
+    previewBar_.SetPreviewMetrics(duration, position);
+}
+
+std::filesystem::path OverlayWindow::BuildRecordingTempPath() const {
+    std::filesystem::path base;
+    try {
+        base = std::filesystem::temp_directory_path();
+    } catch (...) {
+        base = std::filesystem::current_path();
+    }
+    base /= L"SnapPin";
+    base /= L"Recordings";
+    std::error_code ec;
+    std::filesystem::create_directories(base, ec);
+
+    const std::wstring fileName = L"SnapPin_Record_" + FormatNowForFile() + L"_" + std::to_wstring(GetTickCount64() % 1000000ULL) + L".mp4";
+    return base / fileName;
 }
 
 void OverlayWindow::UpdateLongCaptureThumbnailCache(float dpiScale, bool force) {
@@ -3907,7 +4796,8 @@ void OverlayWindow::UpdateCursorVisual(POINT p) {
         if (!whiteboardMode_ && hit != HitKind::None && hit != HitKind::Inside) {
             cursor = CursorForHit(hit);
         } else if (hit == HitKind::Inside) {
-            const bool canMove = ((GetKeyState(VK_CONTROL) & 0x8000) != 0) || IsNearRectBorder(sr, p, borderGrab);
+            const bool canMove = recordingPreviewMode_ ||
+                ((GetKeyState(VK_CONTROL) & 0x8000) != 0) || IsNearRectBorder(sr, p, borderGrab);
             cursor = canMove ? LoadCursorW(nullptr, IDC_SIZEALL) : LoadCursorW(nullptr, IDC_CROSS);
         } else {
             cursor = LoadCursorW(nullptr, IDC_NO);
@@ -3923,7 +4813,7 @@ void OverlayWindow::UpdateCursorVisual(POINT p) {
 }
 
 bool OverlayWindow::IsCursorFollowUiActiveAt(POINT p) const {
-    if (longCaptureMode_ || whiteboardMode_) {
+    if (longCaptureMode_ || whiteboardMode_ || recordingPreviewMode_) {
         return false;
     }
     if (!cursorInfoEnabled_ || !HasSelection()) {
@@ -3945,11 +4835,11 @@ bool OverlayWindow::IsCursorFollowUiActiveAt(POINT p) const {
 }
 
 bool OverlayWindow::ShouldShowCursorInfoOverlay() const {
-    return followHudEnabled_ && tool_ == ToolType::None;
+    return !screenRecordingMode_ && !recordingPreviewMode_ && followHudEnabled_ && tool_ == ToolType::None;
 }
 
 bool OverlayWindow::ShouldShowMagnifierOverlay() const {
-    return followHudEnabled_;
+    return !screenRecordingMode_ && !recordingPreviewMode_ && followHudEnabled_;
 }
 
 bool OverlayWindow::ComputeCrosshairGuideRects(POINT p, RECT& vertical, RECT& horizontal) const {
@@ -4360,7 +5250,7 @@ bool OverlayWindow::SaveSelectionWithoutHistory() {
     const auto ext = output.extension().wstring();
     const bool jpeg = (_wcsicmp(ext.c_str(), L".jpg") == 0 || _wcsicmp(ext.c_str(), L".jpeg") == 0);
     if (!exporter_.SaveImage(composed, output, jpeg)) {
-        MessageBoxW(hwnd_, L"保存失败。", L"SnapPin", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"保存图像失败", L"SnapPin", MB_ICONERROR);
         return false;
     }
     return true;
@@ -4643,15 +5533,13 @@ Image OverlayWindow::ComposeBackgroundSelection() const {
 void OverlayWindow::Finish(OverlayAction action) {
     const bool finishingLongCapture = longCaptureMode_;
     const bool finishingWhiteboard = whiteboardMode_;
+    const bool finishingScreenRecording = screenRecordingMode_;
     if (precisionModeActive_ || (GetKeyState(VK_SHIFT) & 0x8000) != 0) {
         SnapCursorToCrosshair();
         precisionModeActive_ = false;
     }
     if (finishingLongCapture) {
-        if (longCaptureTimer_ != 0) {
-            KillTimer(hwnd_, longCaptureTimer_);
-            longCaptureTimer_ = 0;
-        }
+        StopWindowTimer(longCaptureTimer_);
         longCaptureMode_ = false;
         longCaptureTargetHwnd_ = nullptr;
         longCaptureScrollDir_ = 0;
@@ -4666,6 +5554,13 @@ void OverlayWindow::Finish(OverlayAction action) {
     if (finishingWhiteboard) {
         whiteboardMode_ = false;
         toolbar_.SetWhiteboardMode(false);
+    }
+    if (finishingScreenRecording) {
+        screenRecordingMode_ = false;
+        recordingActive_ = false;
+        recordingPaused_ = false;
+        toolbar_.SetScreenRecordingMode(false);
+        toolbar_.SetRecordingState(false, false);
     }
 
     if (action == OverlayAction::Cancel) {
@@ -4702,3 +5597,5 @@ void OverlayWindow::Finish(OverlayAction action) {
         cb(result);
     }
 }
+
+

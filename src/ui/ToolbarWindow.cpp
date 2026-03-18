@@ -1,7 +1,10 @@
-﻿#include "ui/ToolbarWindow.h"
+#include "ui/ToolbarWindow.h"
 #include "app/AppIds.h"
 #include "ui/GdiObject.h"
 #include "ui/ThemeColors.h"
+#include "ui/UiUtil.h"
+#include "ui/WindowProc.h"
+#include "ui/WindowUtil.h"
 
 namespace
 {
@@ -31,6 +34,11 @@ namespace
         {ID_TOOL_LONG_CAPTURE, L"L", L"\u957F\u622A\u56FE", false},
         {ID_TOOL_OCR, L"\u2315", L"OCR", false},
         {ID_TOOL_WHITEBOARD, L"W", L"\u767D\u677F", false},
+        {ID_TOOL_SCREEN_RECORD, L"\u23FA", L"\u5F55\u5236\u5C4F\u5E55", false},
+        {ID_TOOL_RECORD_TOGGLE, L"\u25CF", L"\u5F00\u59CB\u5F55\u5236", false},
+        {ID_TOOL_RECORD_PAUSE, L"\u23F8", L"\u6682\u505C\u5F55\u5236", false},
+        {ID_TOOL_RECORD_SYSTEM_AUDIO, L"\U0001F50A", L"\u5F55\u5236\u7CFB\u7EDF\u97F3\u9891", false},
+        {ID_TOOL_RECORD_MIC_AUDIO, L"\U0001F3A4", L"\u5F55\u5236\u9EA6\u514B\u98CE\u97F3\u9891", false},
         {ID_TOOL_SAVE, L"\u2193", L"\u4FDD\u5B58", false},
         {ID_TOOL_COPY, L"\u2398", L"\u590D\u5236", false},
         {ID_TOOL_COPY_FILE, L"\u25A3", L"\u590D\u5236\u4E3A\u6587\u4EF6", false},
@@ -50,124 +58,80 @@ namespace
         return nullptr;
     }
 
-    float ParseFloatText(const std::wstring &text, float fallback)
-    {
-        if (text.empty()) {
-            return fallback;
-        }
-        wchar_t *end      = nullptr;
-        const float value = static_cast<float>(wcstod(text.c_str(), &end));
-        if (end == text.c_str()) {
-            return fallback;
-        }
-        return value;
-    }
-
     float ComboFloatValue(HWND combo, float fallback)
     {
         if (!combo) {
             return fallback;
         }
-        int idx = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
-        wchar_t text[64]{};
-        if (idx >= 0) {
-            SendMessageW(combo, CB_GETLBTEXT, static_cast<WPARAM>(idx), reinterpret_cast<LPARAM>(text));
-            return ParseFloatText(text, fallback);
-        }
-        GetWindowTextW(combo, text, static_cast<int>(std::size(text)));
-        return ParseFloatText(text, fallback);
+        const std::wstring text = UiUtil::GetComboSelectionOrWindowText(combo);
+        return UiUtil::ParseFloatOrFallback(text, fallback);
+    }
+
+    int ComboIntValue(HWND combo, int fallback)
+    {
+        return static_cast<int>(std::lround(ComboFloatValue(combo, static_cast<float>(fallback))));
     }
 
     void ConfigureComboControl(HWND combo, int controlHeight, int visibleItems)
     {
-        if (!combo) {
-            return;
-        }
-
-        const int itemHeight = std::max(14, controlHeight - 8);
-        SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), static_cast<LPARAM>(itemHeight));
-        SendMessageW(combo, CB_SETITEMHEIGHT, 0, static_cast<LPARAM>(itemHeight));
-        SendMessageW(combo, CB_SETMINVISIBLE, static_cast<WPARAM>(visibleItems), 0);
+        UiUtil::ConfigureComboControl(combo, controlHeight, visibleItems, 14, 8);
     }
 
     void EnsureDropListTopMost(HWND combo)
     {
-        if (!combo) {
-            return;
-        }
-
-        COMBOBOXINFO info{};
-        info.cbSize = sizeof(info);
-        if (GetComboBoxInfo(combo, &info) && info.hwndList) {
-            SetWindowPos(info.hwndList, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        }
+        UiUtil::EnsureComboListTopMost(combo);
     }
 
     void ApplyStableComboTheme(HWND combo)
     {
-        if (!combo) {
-            return;
-        }
-        using SetWindowThemeFn           = HRESULT(WINAPI *)(HWND, LPCWSTR, LPCWSTR);
-        static SetWindowThemeFn setTheme = []() -> SetWindowThemeFn {
-            HMODULE h = LoadLibraryW(L"uxtheme.dll");
-            if (!h) {
-                return nullptr;
-            }
-            return reinterpret_cast<SetWindowThemeFn>(GetProcAddress(h, "SetWindowTheme"));
-        }();
-        if (setTheme) {
-            setTheme(combo, L"", L"");
-        }
-        LONG_PTR ex = GetWindowLongPtrW(combo, GWL_EXSTYLE);
-        if ((ex & WS_EX_CLIENTEDGE) != 0) {
-            SetWindowLongPtrW(combo, GWL_EXSTYLE, ex & ~WS_EX_CLIENTEDGE);
-            SetWindowPos(combo, nullptr, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        }
-        LONG_PTR style = GetWindowLongPtrW(combo, GWL_STYLE);
-        if ((style & WS_BORDER) != 0) {
-            SetWindowLongPtrW(combo, GWL_STYLE, style & ~WS_BORDER);
-            SetWindowPos(combo, nullptr, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        }
-        SendMessageW(combo, CB_SETEXTENDEDUI, TRUE, 0);
+        UiUtil::ApplyStableComboTheme(combo);
     }
 
-    void RegisterToolbarWindowClassOnce(std::once_flag &once, HINSTANCE hInstance, WNDPROC proc)
+    bool IsButtonClickNotifyCode(UINT notifyCode)
     {
-        std::call_once(once, [hInstance, proc]() {
-            WNDCLASSW wc{};
-            wc.lpfnWndProc   = proc;
-            wc.hInstance     = hInstance;
-            wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-            wc.lpszClassName = kToolbarWindowClassName;
-            wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-            RegisterClassW(&wc);
-        });
+        return notifyCode == BN_CLICKED || notifyCode == BN_DOUBLECLICKED;
     }
 }
 
 LRESULT CALLBACK ToolbarWindow::ToolbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    ToolbarWindow *self = reinterpret_cast<ToolbarWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    if (msg == WM_NCCREATE) {
-        auto *cs = reinterpret_cast<CREATESTRUCTW *>(lParam);
-        self     = reinterpret_cast<ToolbarWindow *>(cs->lpCreateParams);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-    }
+    auto* self = WINDOW_PROC_GET_THIS(ToolbarWindow);
+    WindowProc::HandleWindowCreate(hwnd, msg, lParam, self);
 
     switch (msg) {
     case WM_COMMAND: {
-        if (self && LOWORD(wParam) == ID_TOOL_FILL_ENABLE && HIWORD(wParam) == BN_CLICKED) {
+        if (self && LOWORD(wParam) == ID_TOOL_FILL_ENABLE && IsButtonClickNotifyCode(HIWORD(wParam))) {
             self->fillEnabledValue_ = !self->fillEnabledValue_;
             if (self->chkFill_) {
                 InvalidateRect(self->chkFill_, nullptr, FALSE);
             }
         }
-        if (HIWORD(wParam) == CBN_DROPDOWN) {
+        if (self && LOWORD(wParam) == ID_TOOL_RECORD_SYSTEM_AUDIO && IsButtonClickNotifyCode(HIWORD(wParam))) {
+            self->recordSystemAudioValue_ = !self->recordSystemAudioValue_;
+            if (HWND btn = self->ControlById(ID_TOOL_RECORD_SYSTEM_AUDIO)) {
+                InvalidateRect(btn, nullptr, FALSE);
+            }
+        }
+        if (self && LOWORD(wParam) == ID_TOOL_RECORD_MIC_AUDIO && IsButtonClickNotifyCode(HIWORD(wParam))) {
+            self->recordMicrophoneAudioValue_ = !self->recordMicrophoneAudioValue_;
+            if (HWND btn = self->ControlById(ID_TOOL_RECORD_MIC_AUDIO)) {
+                InvalidateRect(btn, nullptr, FALSE);
+            }
+        }
+        if (self && HIWORD(wParam) == CBN_DROPDOWN) {
+            self->openComboControlId_ = LOWORD(wParam);
+            if (HWND combo = self->ControlById(self->openComboControlId_)) {
+                self->openComboSelectionIndex_ = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+            } else {
+                self->openComboSelectionIndex_ = -1;
+            }
             EnsureDropListTopMost(reinterpret_cast<HWND>(lParam));
+            self->UpdateHoverState();
+        }
+        if (self && HIWORD(wParam) == CBN_CLOSEUP) {
+            self->openComboControlId_ = 0;
+            self->openComboSelectionIndex_ = -1;
+            self->UpdateHoverState();
         }
         HWND owner = GetWindow(hwnd, GW_OWNER);
         if (owner) {
@@ -237,7 +201,8 @@ LRESULT CALLBACK ToolbarWindow::ToolbarProc(HWND hwnd, UINT msg, WPARAM wParam, 
     case WM_MEASUREITEM:
         if (self) {
             auto *mi = reinterpret_cast<MEASUREITEMSTRUCT *>(lParam);
-            if (mi && (mi->CtlID == ID_TOOL_STROKE_WIDTH || mi->CtlID == ID_TOOL_TEXT_SIZE || mi->CtlID == ID_TOOL_TEXT_STYLE)) {
+            if (mi && (mi->CtlID == ID_TOOL_STROKE_WIDTH || mi->CtlID == ID_TOOL_TEXT_SIZE || mi->CtlID == ID_TOOL_TEXT_STYLE ||
+                       mi->CtlID == ID_TOOL_RECORD_DELAY || mi->CtlID == ID_TOOL_RECORD_FPS)) {
                 const float s  = static_cast<float>(self->dpi_) / 96.0f;
                 mi->itemHeight = static_cast<UINT>(std::max(18, static_cast<int>(std::round(24.0f * s))));
                 return TRUE;
@@ -277,16 +242,18 @@ bool ToolbarWindow::IsButtonLikeControlId(UINT id) const
     if (buttons_.count(id) > 0) {
         return true;
     }
-    return id == ID_TOOL_STROKE_COLOR || id == ID_TOOL_FILL_ENABLE ||
-           id == ID_TOOL_FILL_COLOR || id == ID_TOOL_TEXT_COLOR;
+    return id == ID_TOOL_STROKE_WIDTH || id == ID_TOOL_STROKE_COLOR ||
+           id == ID_TOOL_FILL_ENABLE || id == ID_TOOL_FILL_COLOR ||
+           id == ID_TOOL_TEXT_SIZE || id == ID_TOOL_TEXT_STYLE || id == ID_TOOL_TEXT_COLOR ||
+           id == ID_TOOL_RECORD_DELAY || id == ID_TOOL_RECORD_FPS;
 }
-
 bool ToolbarWindow::IsComboControl(HWND hwnd) const
 {
     if (!hwnd) {
         return false;
     }
-    return hwnd == cmbStroke_ || hwnd == cmbTextSize_ || hwnd == cmbTextStyle_;
+    return hwnd == cmbStroke_ || hwnd == cmbTextSize_ || hwnd == cmbTextStyle_ ||
+           hwnd == cmbRecordDelay_ || hwnd == cmbRecordFps_;
 }
 
 bool ToolbarWindow::IsComboList(HWND hwnd) const
@@ -302,7 +269,8 @@ bool ToolbarWindow::IsComboList(HWND hwnd) const
         info.cbSize = sizeof(info);
         return GetComboBoxInfo(combo, &info) && info.hwndList && info.hwndList == hwnd;
     };
-    return matchList(cmbStroke_) || matchList(cmbTextSize_) || matchList(cmbTextStyle_);
+    return matchList(cmbStroke_) || matchList(cmbTextSize_) || matchList(cmbTextStyle_) ||
+           matchList(cmbRecordDelay_) || matchList(cmbRecordFps_);
 }
 
 bool ToolbarWindow::IsComboRelatedControl(HWND hwnd) const
@@ -334,6 +302,10 @@ HWND ToolbarWindow::ControlById(UINT id) const
         return cmbTextStyle_;
     case ID_TOOL_TEXT_COLOR:
         return btnTextColor_;
+    case ID_TOOL_RECORD_DELAY:
+        return cmbRecordDelay_;
+    case ID_TOOL_RECORD_FPS:
+        return cmbRecordFps_;
     default:
         return nullptr;
     }
@@ -341,10 +313,7 @@ HWND ToolbarWindow::ControlById(UINT id) const
 
 void ToolbarWindow::HideTrackedTooltip()
 {
-    if (tooltip_) {
-        ShowWindow(tooltip_, SW_HIDE);
-    }
-    trackedTooltipVisible_ = false;
+    UiUtil::HideTrackedTooltipWindow(tooltip_, trackedTooltipVisible_);
 }
 
 void ToolbarWindow::ActivateTrackedTooltip(UINT id, POINT screenPt)
@@ -357,45 +326,8 @@ void ToolbarWindow::ActivateTrackedTooltip(UINT id, POINT screenPt)
         HideTrackedTooltip();
         return;
     }
-
-    if (trackedTooltipText_ != text) {
-        trackedTooltipText_ = text;
-        SetWindowTextW(tooltip_, trackedTooltipText_.c_str());
-    }
-
-    HDC hdc = GetDC(tooltip_);
-    RECT textRc{0, 0, 0, 0};
-    if (hdc) {
-        UiGdi::ScopedSelectObject selectedFont(hdc, font_);
-        DrawTextW(hdc, trackedTooltipText_.c_str(), -1, &textRc, DT_CALCRECT | DT_SINGLELINE);
-        ReleaseDC(hwnd_, hdc);
-    }
-
-    const int padX = 12;
-    const int padY = 8;
-    int width      = std::max(60, RectWidth(textRc) + padX * 2);
-    int height     = std::max(24, RectHeight(textRc) + padY);
-    int x          = screenPt.x + 14;
-    int y          = screenPt.y + 24;
-
-    MONITORINFO mi{};
-    mi.cbSize    = sizeof(mi);
-    HMONITOR mon = MonitorFromPoint(screenPt, MONITOR_DEFAULTTONEAREST);
-    if (mon && GetMonitorInfoW(mon, &mi)) {
-        x = std::clamp(x, static_cast<int>(mi.rcWork.left),
-                       std::max(static_cast<int>(mi.rcWork.left), static_cast<int>(mi.rcWork.right - width)));
-        y = std::clamp(y, static_cast<int>(mi.rcWork.top),
-                       std::max(static_cast<int>(mi.rcWork.top), static_cast<int>(mi.rcWork.bottom - height)));
-    }
-
-    if (font_) {
-        SendMessageW(tooltip_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
-    }
-    SetWindowPos(tooltip_, HWND_TOPMOST, x, y, width, height,
-                 SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    trackedTooltipVisible_ = true;
+    UiUtil::ShowTrackedTooltipWindow(hwnd_, tooltip_, font_, text, trackedTooltipText_, trackedTooltipVisible_, screenPt);
 }
-
 void ToolbarWindow::UpdateHoverState()
 {
     if (!hwnd_ || !IsWindowVisible(hwnd_)) {
@@ -409,11 +341,15 @@ void ToolbarWindow::UpdateHoverState()
     GetCursorPos(&sp);
     HWND hit   = WindowFromPoint(sp);
     UINT hitId = 0;
-    if (hit == tooltip_) {
-        hitId = hoveredControlId_;
-    }
-    if (hit && (hit == hwnd_ || IsChild(hwnd_, hit))) {
-        HWND ctrl = hit;
+    bool shouldSetCursor = false;
+    bool interactiveCursor = false;
+    bool tooltipEligible = false;
+
+    auto resolveToolbarControl = [&](HWND wnd) -> HWND {
+        if (!wnd) {
+            return nullptr;
+        }
+        HWND ctrl = wnd;
         if (ctrl == hwnd_) {
             POINT cp = sp;
             ScreenToClient(hwnd_, &cp);
@@ -422,9 +358,57 @@ void ToolbarWindow::UpdateHoverState()
                 ctrl = nullptr;
             }
         }
-        if (ctrl && IsChild(hwnd_, ctrl)) {
-            hitId = static_cast<UINT>(GetDlgCtrlID(ctrl));
+        return (ctrl && IsChild(hwnd_, ctrl)) ? ctrl : nullptr;
+    };
+
+    auto isPointInWindow = [&](HWND wnd) -> bool {
+        if (!wnd || !IsWindow(wnd)) {
+            return false;
         }
+        RECT rc{};
+        return GetWindowRect(wnd, &rc) && PtInRect(&rc, sp);
+    };
+
+    auto isOverOpenComboList = [&]() -> bool {
+        if (openComboControlId_ == 0) {
+            return false;
+        }
+        HWND combo = ControlById(openComboControlId_);
+        if (!combo || !IsWindow(combo)) {
+            return false;
+        }
+        COMBOBOXINFO info{};
+        info.cbSize = sizeof(info);
+        if (!GetComboBoxInfo(combo, &info) || !info.hwndList || !IsWindow(info.hwndList)) {
+            return false;
+        }
+        return isPointInWindow(info.hwndList);
+    };
+
+    HWND ctrl = nullptr;
+    if (hit == tooltip_) {
+        if (isPointInWindow(hwnd_)) {
+            ctrl = resolveToolbarControl(hwnd_);
+        }
+    } else {
+        ctrl = resolveToolbarControl(hit);
+    }
+
+    if (ctrl) {
+        const UINT ctrlId = static_cast<UINT>(GetDlgCtrlID(ctrl));
+        hitId = ctrlId;
+        shouldSetCursor = true;
+        interactiveCursor = IsButtonLikeControlId(ctrlId) || IsComboControl(ctrl);
+        tooltipEligible = interactiveCursor;
+    } else if (isOverOpenComboList()) {
+        hitId = openComboControlId_;
+        shouldSetCursor = true;
+        interactiveCursor = true;
+        tooltipEligible = false;
+    }
+
+    if (shouldSetCursor) {
+        SetCursor(LoadCursorW(nullptr, interactiveCursor ? IDC_HAND : IDC_ARROW));
     }
 
     if (hoveredControlId_ != hitId) {
@@ -438,7 +422,7 @@ void ToolbarWindow::UpdateHoverState()
         }
     }
 
-    if (hitId == 0 || TooltipForControlId(hitId).empty()) {
+    if (!tooltipEligible || hitId == 0 || TooltipForControlId(hitId).empty()) {
         pendingHoverId_ = 0;
         HideTrackedTooltip();
         return;
@@ -467,7 +451,8 @@ Gdiplus::RectF InsetRectF(const RECT &rc, float pad)
     return Gdiplus::RectF(l, t, std::max(1.0f, r - l), std::max(1.0f, b - t));
 }
 
-bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiScale)
+bool ToolbarWindow::DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiScale,
+                                    bool recordingActive, bool recordingPaused)
 {
     if (!hdc) {
         return false;
@@ -521,20 +506,12 @@ bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiSca
         g.FillEllipse(&brushRef, rr.X, rr.Y, rr.Width, rr.Height);
     };
     // Compatibility aliases: keep existing icon geometry call sites readable while using unified primitives above.
-    auto P         = [&](float x, float y) -> Gdiplus::PointF { return Pt24(x, y); };
-    auto R24       = [&](float x, float y, float ww, float hh) -> Gdiplus::RectF { return Rect24(x, y, ww, hh); };
-    auto DrawRectF = [&](const Gdiplus::RectF &rr) { DrawRect(thickPen, rr); };
-    auto FillRectF = [&](Gdiplus::Brush *b, const Gdiplus::RectF &rr) {
-        if (b) {
-            g.FillRectangle(b, rr.X, rr.Y, rr.Width, rr.Height);
-        }
-    };
+    auto P            = [&](float x, float y) -> Gdiplus::PointF { return Pt24(x, y); };
+    auto R24          = [&](float x, float y, float ww, float hh) -> Gdiplus::RectF { return Rect24(x, y, ww, hh); };
+    auto DrawRectF    = [&](const Gdiplus::RectF &rr) { DrawRect(thickPen, rr); };
+    auto FillRectF    = [&](const Gdiplus::RectF &rr) { FillRect(brush, rr); };
     auto DrawEllipseF = [&](const Gdiplus::RectF &rr) { DrawEllipse(thickPen, rr); };
-    auto FillEllipseF = [&](Gdiplus::Brush *b, const Gdiplus::RectF &rr) {
-        if (b) {
-            g.FillEllipse(b, rr.X, rr.Y, rr.Width, rr.Height);
-        }
-    };
+    auto FillEllipseF = [&](const Gdiplus::RectF &rr) { FillEllipse(brush, rr); };
 
     auto MakeRoundRectPath = [&](const Gdiplus::RectF &rr, float radiusPx, Gdiplus::GraphicsPath &path) {
         const float d  = radiusPx * 2.0f;
@@ -575,10 +552,10 @@ bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiSca
         DrawRectF(rr0);
 
         const float hs = 3.0f;
-        FillRectF(&accentBrush, R24(2.4f, 2.4f, hs, hs));
-        FillRectF(&accentBrush, R24(18.6f, 2.4f, hs, hs));
-        FillRectF(&accentBrush, R24(2.4f, 18.6f, hs, hs));
-        FillRectF(&accentBrush, R24(18.6f, 18.6f, hs, hs));
+        FillRect(accentBrush, R24(2.4f, 2.4f, hs, hs));
+        FillRect(accentBrush, R24(18.6f, 2.4f, hs, hs));
+        FillRect(accentBrush, R24(2.4f, 18.6f, hs, hs));
+        FillRect(accentBrush, R24(18.6f, 18.6f, hs, hs));
         return true;
     }
 
@@ -592,8 +569,8 @@ bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiSca
         g.DrawLine(&thinPen, P(5.0f, 19.0f), P(19.0f, 5.0f));
 
         const float rDot = 2.5f;
-        FillEllipseF(&brush, R24(5.0f - rDot, 19.0f - rDot, 2.0f * rDot, 2.0f * rDot));
-        FillEllipseF(&brush, R24(19.0f - rDot, 5.0f - rDot, 2.0f * rDot, 2.0f * rDot));
+        FillEllipseF(R24(5.0f - rDot, 19.0f - rDot, 2.0f * rDot, 2.0f * rDot));
+        FillEllipseF(R24(19.0f - rDot, 5.0f - rDot, 2.0f * rDot, 2.0f * rDot));
         return true;
     }
 
@@ -621,10 +598,10 @@ bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiSca
         MakeRoundRectPath(outer, 3.6f * s, path);
         g.FillPath(&accentBrush, &path);
         g.DrawPath(&thickPen, &path);
-        FillRectF(&brush, R24(10.0f, 5.2f, 4.8f, 4.8f));
-        FillRectF(&brush, R24(5.2f, 10.0f, 4.8f, 4.8f));
-        FillRectF(&brush, R24(14.0f, 10.0f, 4.8f, 4.8f));
-        FillRectF(&brush, R24(10.0f, 14.0f, 4.8f, 4.8f));
+        FillRectF(R24(10.0f, 5.2f, 4.8f, 4.8f));
+        FillRectF(R24(5.2f, 10.0f, 4.8f, 4.8f));
+        FillRectF(R24(14.0f, 10.0f, 4.8f, 4.8f));
+        FillRectF(R24(10.0f, 14.0f, 4.8f, 4.8f));
         return true;
     }
 
@@ -794,9 +771,59 @@ bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiSca
     }
     case ID_TOOL_WHITEBOARD: {
         DrawRectF(R24(2.5f, 2.8f, 19.0f, 13.2f));
-        FillRectF(&accentBrush, R24(5.1f, 5.7f, 13.8f, 7.4f));
+        FillRect(accentBrush, R24(5.1f, 5.7f, 13.8f, 7.4f));
         g.DrawLine(&thinPen, P(9.5f, 16.0f), P(5.0f, 22.0f));
         g.DrawLine(&thinPen, P(14.5f, 16.0f), P(19.0f, 22.0f));
+        return true;
+    }
+    case ID_TOOL_SCREEN_RECORD: {
+        DrawRectF(R24(0.0f, 4.0f, 18.0f, 16.0f));
+        FillEllipseF(R24(3.5f, 7.5f, 4.0f, 4.0f));
+        Gdiplus::PointF horn[] = {P(18.0f, 9.0f), P(24.0f, 6.0f), P(24.0f, 18.0f), P(18.0f, 15.0f)};
+        g.DrawPolygon(&thinPen, horn, static_cast<INT>(std::size(horn)));
+        return true;
+    }
+    case ID_TOOL_RECORD_SYSTEM_AUDIO: {
+        Gdiplus::PointF body[] = {P(0.0f, 7.0f), P(9.0f, 7.0f), P(14.0f, 1.0f), P(14.0f, 23.0f), P(9.0f, 17.0f), P(0.0f, 17.0f)};
+        g.FillPolygon(&brush, body, static_cast<INT>(std::size(body)));
+        g.DrawArc(&thinPen, R24(8.0f, 6.0f, 12.0f, 12.0f), -45.0f, 90.0f);
+        g.DrawArc(&thinPen, R24(4.0f, 2.0f, 20.0f, 20.0f), -45.0f, 90.0f);
+        return true;
+    }
+    case ID_TOOL_RECORD_MIC_AUDIO: {
+        FillEllipseF(R24(7.0f, 0.0f, 10.0f, 10.0f));
+        FillEllipseF(R24(7.0f, 7.0f, 10.0f, 10.0f));
+        FillRectF(R24(7.0f, 5.0f, 10.0f, 7.0f));
+        g.DrawArc(&thinPen, R24(4.0f, 4.0f, 16.0f, 16.0f), 0.0f, 180.0f);
+        g.DrawLine(&thickPen, P(12.0f, 20.0f), P(12.0f, 23.8f));
+        g.DrawLine(&thinPen, P(7.0f, 24.0f), P(17.0f, 24.0f));
+        return true;
+    }
+    case ID_TOOL_RECORD_TOGGLE: {
+        const Gdiplus::Color redColor(255, 222, 63, 4);
+        Gdiplus::Pen redPen(redColor, stroke * 0.8f);
+        Gdiplus::SolidBrush redBrush(redColor);
+        if (recordingActive) {
+            DrawRect(redPen, R24(3.5f, 3.5f, 17.0f, 17.0f));
+            FillRect(redBrush, R24(3.5f, 3.5f, 17.0f, 17.0f));
+        } else {
+            DrawEllipse(redPen, R24(1.0f, 1.0f, 22.0f, 22.0f));
+            FillEllipse(redBrush, R24(6.5f, 6.5f, 11.0f, 11.0f));
+        }
+        return true;
+    }
+    case ID_TOOL_RECORD_PAUSE: {
+        if (recordingPaused) {
+            Gdiplus::PointF triangle[] = {
+                P(20.8f, 12.0f),
+                P(6.0f, 2.0f),
+                P(6.0f, 22.0f)};
+            g.FillPolygon(&brush, triangle, (INT)std::size(triangle));
+            g.DrawPolygon(&thickPen, triangle, (INT)std::size(triangle));
+        } else {
+            FillRectF(R24(4.5f, 3.5f, 5.0f, 17.0f));
+            FillRectF(R24(14.5f, 3.5f, 5.0f, 17.0f));
+        }
         return true;
     }
     case ID_TOOL_TRIM_ABOVE: {
@@ -828,7 +855,14 @@ bool DrawToolbarIcon(UINT id, HDC hdc, const RECT &rc, COLORREF fg, float dpiSca
 void ToolbarWindow::PreloadClass(HINSTANCE hInstance)
 {
     static std::once_flag once;
-    RegisterToolbarWindowClassOnce(once, hInstance, ToolbarWindow::ToolbarProc);
+    WindowUtil::RegisterWindowClassOnce(
+        once,
+        hInstance,
+        kToolbarWindowClassName,
+        ToolbarWindow::ToolbarProc,
+        LoadCursorW(nullptr, IDC_ARROW),
+        0,
+        reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
 }
 
 void ToolbarWindow::WarmUp(HWND parent, HINSTANCE hInstance)
@@ -875,6 +909,14 @@ bool ToolbarWindow::Create(HWND parent, HINSTANCE hInstance)
 
 std::wstring ToolbarWindow::TooltipForControlId(UINT id) const
 {
+    switch (id) {
+    case ID_TOOL_RECORD_TOGGLE:
+        return recordingActive_ ? L"\u505C\u6B62\u5F55\u5236" : L"\u5F00\u59CB\u5F55\u5236";
+    case ID_TOOL_RECORD_PAUSE:
+        return recordingPaused_ ? L"\u7EE7\u7EED\u5F55\u5236" : L"\u6682\u505C\u5F55\u5236";
+    default:
+        break;
+    }
     if (const ButtonDef *def = FindButtonDef(id)) {
         return def->tooltipText;
     }
@@ -884,15 +926,19 @@ std::wstring ToolbarWindow::TooltipForControlId(UINT id) const
     case ID_TOOL_STROKE_COLOR:
         return L"\u7EBF\u6761\u989C\u8272";
     case ID_TOOL_FILL_ENABLE:
-        return L"\u586B\u5145\u5F00\u5173";
+        return L"\u586B\u5145";
     case ID_TOOL_FILL_COLOR:
         return L"\u586B\u5145\u989C\u8272";
     case ID_TOOL_TEXT_SIZE:
         return L"\u6587\u5B57\u5927\u5C0F";
     case ID_TOOL_TEXT_STYLE:
-        return L"\u6587\u5B57\u6837\u5F0F";
+        return L"\u5b57\u4f53";
     case ID_TOOL_TEXT_COLOR:
         return L"\u6587\u5B57\u989C\u8272";
+    case ID_TOOL_RECORD_DELAY:
+        return L"\u5F55\u5236\u5EF6\u8FDF";
+    case ID_TOOL_RECORD_FPS:
+        return L"\u5E27\u7387";
     default:
         return L"";
     }
@@ -904,39 +950,17 @@ void ToolbarWindow::CreateTooltips()
     if (!hwnd_) {
         return;
     }
-
-    tooltip_ = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        L"STATIC",
-        L"",
-        WS_POPUP | SS_CENTER | SS_CENTERIMAGE | WS_BORDER,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        nullptr,
-        nullptr,
-        reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd_, GWLP_HINSTANCE)),
-        nullptr);
+    tooltip_ = UiUtil::CreateTrackedTooltipWindow(hwnd_, font_);
     if (!tooltip_) {
         return;
     }
-
-    if (font_) {
-        SendMessageW(tooltip_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
-    }
-    SetWindowPos(tooltip_, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
     trackedTooltipVisible_ = false;
     trackedTooltipText_.clear();
 }
 
 void ToolbarWindow::DestroyTooltips()
 {
-    HideTrackedTooltip();
-    if (tooltip_) {
-        DestroyWindow(tooltip_);
-        tooltip_ = nullptr;
-    }
-    trackedTooltipText_.clear();
-    trackedTooltipVisible_ = false;
+    UiUtil::DestroyTrackedTooltipWindow(tooltip_, trackedTooltipVisible_, trackedTooltipText_);
 }
 
 void ToolbarWindow::CreateButtons()
@@ -967,10 +991,11 @@ void ToolbarWindow::CreateButtons()
         }
     }
 
-    const int comboW     = std::max(56, static_cast<int>(std::round(62.0f * s)));
-    const int colorBtnW  = btnH;
-    const int checkW     = btnH;
-    const int textStyleW = std::max(74, static_cast<int>(std::round(86.0f * s)));
+    const int comboW       = std::max(56, static_cast<int>(std::round(62.0f * s)));
+    const int colorBtnW    = btnH;
+    const int checkW       = btnH;
+    const int textStyleW   = std::max(74, static_cast<int>(std::round(86.0f * s)));
+    const int recordComboW = std::max(74, static_cast<int>(std::round(88.0f * s)));
 
     cmbStroke_ = CreateWindowW(WC_COMBOBOXW, L"",
                                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
@@ -981,7 +1006,7 @@ void ToolbarWindow::CreateButtons()
     int strokeSelect                                   = 0;
     for (size_t i = 0; i < strokeValues.size(); ++i) {
         SendMessageW(cmbStroke_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(strokeValues[i]));
-        if (std::fabs(ParseFloatText(strokeValues[i], strokeWidthValue_) - strokeWidthValue_) < 0.01f) {
+        if (std::fabs(UiUtil::ParseFloatOrFallback(strokeValues[i], strokeWidthValue_) - strokeWidthValue_) < 0.01f) {
             strokeSelect = static_cast<int>(i);
         }
     }
@@ -1011,7 +1036,7 @@ void ToolbarWindow::CreateButtons()
     int textSizeSelect                             = 0;
     for (size_t i = 0; i < textSizes.size(); ++i) {
         SendMessageW(cmbTextSize_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(textSizes[i]));
-        if (std::fabs(ParseFloatText(textSizes[i], textSizeValue_) - textSizeValue_) < 0.01f) {
+        if (std::fabs(UiUtil::ParseFloatOrFallback(textSizes[i], textSizeValue_) - textSizeValue_) < 0.01f) {
             textSizeSelect = static_cast<int>(i);
         }
     }
@@ -1022,10 +1047,10 @@ void ToolbarWindow::CreateButtons()
                                   0, 0, textStyleW, comboPopupHeight_,
                                   hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TOOL_TEXT_STYLE)), nullptr, nullptr);
     ApplyStableComboTheme(cmbTextStyle_);
-    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"常规"));
-    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"粗体"));
-    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"斜体"));
-    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"粗斜"));
+    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"\u5E38\u89C4"));
+    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"\u7C97\u4F53"));
+    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"\u659C\u4F53"));
+    SendMessageW(cmbTextStyle_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"\u7C97\u659C"));
     int styleSelect = 0;
     if ((textStyleValue_ & Gdiplus::FontStyleBold) != 0 && (textStyleValue_ & Gdiplus::FontStyleItalic) != 0) {
         styleSelect = 3;
@@ -1041,12 +1066,49 @@ void ToolbarWindow::CreateButtons()
                                   0, 0, colorBtnW, btnH,
                                   hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TOOL_TEXT_COLOR)), nullptr, nullptr);
 
+    cmbRecordDelay_ = CreateWindowW(WC_COMBOBOXW, L"",
+                                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                                    0, 0, recordComboW, comboPopupHeight_,
+                                    hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TOOL_RECORD_DELAY)), nullptr, nullptr);
+    ApplyStableComboTheme(cmbRecordDelay_);
+    const std::array<const wchar_t *, 4> recordDelayValues = {L"0s", L"3s", L"5s", L"10s"};
+    int recordDelaySelect                                  = 0;
+    for (size_t i = 0; i < recordDelayValues.size(); ++i) {
+        SendMessageW(cmbRecordDelay_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(recordDelayValues[i]));
+    }
+    if (recordingDelayMsValue_ == 3000) {
+        recordDelaySelect = 1;
+    } else if (recordingDelayMsValue_ == 5000) {
+        recordDelaySelect = 2;
+    } else if (recordingDelayMsValue_ == 10000) {
+        recordDelaySelect = 3;
+    }
+    SendMessageW(cmbRecordDelay_, CB_SETCURSEL, recordDelaySelect, 0);
+
+    cmbRecordFps_ = CreateWindowW(WC_COMBOBOXW, L"",
+                                  WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                                  0, 0, recordComboW, comboPopupHeight_,
+                                  hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TOOL_RECORD_FPS)), nullptr, nullptr);
+    ApplyStableComboTheme(cmbRecordFps_);
+    const std::array<const wchar_t *, 5> recordFpsValues = {L"5fps", L"16fps", L"24fps", L"30fps", L"60fps"};
+    int recordFpsSelect                                  = 2;
+    for (size_t i = 0; i < recordFpsValues.size(); ++i) {
+        SendMessageW(cmbRecordFps_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(recordFpsValues[i]));
+        if (UiUtil::ParseFloatOrFallback(recordFpsValues[i], static_cast<float>(recordingFpsValue_)) == static_cast<float>(recordingFpsValue_)) {
+            recordFpsSelect = static_cast<int>(i);
+        }
+    }
+    SendMessageW(cmbRecordFps_, CB_SETCURSEL, recordFpsSelect, 0);
+
     ConfigureComboControl(cmbStroke_, btnH, 8);
     ConfigureComboControl(cmbTextSize_, btnH, 8);
     ConfigureComboControl(cmbTextStyle_, btnH, 8);
+    ConfigureComboControl(cmbRecordDelay_, btnH, 6);
+    ConfigureComboControl(cmbRecordFps_, btnH, 6);
 
     CreateTooltips();
     ApplyColorLabels();
+    ApplyRecordingControlState();
     RelayoutVisibleControls();
 }
 
@@ -1063,6 +1125,11 @@ void ToolbarWindow::RelayoutVisibleControls()
     const int margin       = std::max(2, static_cast<int>(std::round(4.0f * s)));
     const int btnH         = std::max(24, static_cast<int>(std::round(28.0f * s)));
     const int groupSepPad  = std::max(8, static_cast<int>(std::round(10.0f * s)));
+    const int comboW       = std::max(56, static_cast<int>(std::round(62.0f * s)));
+    const int colorBtnW    = btnH;
+    const int checkW       = btnH;
+    const int textStyleW   = std::max(74, static_cast<int>(std::round(86.0f * s)));
+    const int recordComboW = std::max(70, static_cast<int>(std::round(78.0f * s)));
     auto addGroupSeparator = [&](int &xx) {
         xx = std::max(margin, xx - gap);
         separatorXs_.push_back(xx + groupSepPad);
@@ -1084,17 +1151,13 @@ void ToolbarWindow::RelayoutVisibleControls()
     };
 
     int x = margin;
-    if (longCaptureMode_) {
+    if (screenRecordingMode_) {
         for (UINT id : modeButtonIds_) {
             HWND h = buttons_.count(id) ? buttons_[id] : nullptr;
             int w  = buttonWidths_.count(id) ? buttonWidths_[id] : 34;
             place(h, x, w, false);
         }
 
-        const int comboW     = std::max(56, static_cast<int>(std::round(62.0f * s)));
-        const int colorBtnW  = btnH;
-        const int checkW     = btnH;
-        const int textStyleW = std::max(74, static_cast<int>(std::round(86.0f * s)));
         place(cmbStroke_, x, comboW, false, true);
         place(btnStrokeColor_, x, colorBtnW, false);
         place(chkFill_, x, checkW, false);
@@ -1102,6 +1165,50 @@ void ToolbarWindow::RelayoutVisibleControls()
         place(cmbTextSize_, x, comboW, false, true);
         place(cmbTextStyle_, x, textStyleW, false, true);
         place(btnTextColor_, x, colorBtnW, false);
+
+        const std::array<UINT, 5> recordingButtons = {
+            ID_TOOL_RECORD_SYSTEM_AUDIO,
+            ID_TOOL_RECORD_MIC_AUDIO,
+            ID_TOOL_RECORD_TOGGLE,
+            ID_TOOL_RECORD_PAUSE,
+            ID_TOOL_CANCEL};
+        place(cmbRecordDelay_, x, recordComboW - 13, true, true);
+        place(cmbRecordFps_, x, recordComboW, true, true);
+        addGroupSeparator(x);
+        bool hasAction = false;
+        for (UINT id : recordingButtons) {
+            if (hasAction && (id == ID_TOOL_RECORD_TOGGLE || id == ID_TOOL_CANCEL)) {
+                addGroupSeparator(x);
+            }
+            HWND h = buttons_.count(id) ? buttons_[id] : nullptr;
+            int w  = buttonWidths_.count(id) ? buttonWidths_[id] : 34;
+            place(h, x, w, true);
+            hasAction = true;
+        }
+        for (UINT id : actionButtonIds_) {
+            if (std::find(recordingButtons.begin(), recordingButtons.end(), id) != recordingButtons.end()) {
+                continue;
+            }
+            HWND h = buttons_.count(id) ? buttons_[id] : nullptr;
+            int w  = buttonWidths_.count(id) ? buttonWidths_[id] : 34;
+            place(h, x, w, false);
+        }
+    } else if (longCaptureMode_) {
+        for (UINT id : modeButtonIds_) {
+            HWND h = buttons_.count(id) ? buttons_[id] : nullptr;
+            int w  = buttonWidths_.count(id) ? buttonWidths_[id] : 34;
+            place(h, x, w, false);
+        }
+
+        place(cmbStroke_, x, comboW, false, true);
+        place(btnStrokeColor_, x, colorBtnW, false);
+        place(chkFill_, x, checkW, false);
+        place(btnFillColor_, x, colorBtnW, false);
+        place(cmbTextSize_, x, comboW, false, true);
+        place(cmbTextStyle_, x, textStyleW, false, true);
+        place(btnTextColor_, x, colorBtnW, false);
+        place(cmbRecordDelay_, x, recordComboW, false, true);
+        place(cmbRecordFps_, x, recordComboW, false, true);
 
         const std::array<UINT, 7> longCaptureActions = {
             ID_TOOL_TRIM_ABOVE,
@@ -1144,11 +1251,6 @@ void ToolbarWindow::RelayoutVisibleControls()
             addGroupSeparator(x);
         }
 
-        const int comboW     = std::max(56, static_cast<int>(std::round(62.0f * s)));
-        const int colorBtnW  = btnH;
-        const int checkW     = btnH;
-        const int textStyleW = std::max(74, static_cast<int>(std::round(86.0f * s)));
-
         bool showStroke = false;
         bool showFill   = false;
         bool showText   = false;
@@ -1179,6 +1281,8 @@ void ToolbarWindow::RelayoutVisibleControls()
         place(cmbTextSize_, x, comboW, showText, true);
         place(cmbTextStyle_, x, textStyleW, showText, true);
         place(btnTextColor_, x, colorBtnW, showText);
+        place(cmbRecordDelay_, x, recordComboW, false, true);
+        place(cmbRecordFps_, x, recordComboW, false, true);
 
         if (showStroke || showFill || showText) {
             addGroupSeparator(x);
@@ -1247,11 +1351,6 @@ void ToolbarWindow::RelayoutVisibleControls()
             break;
         }
 
-        const int comboW     = std::max(56, static_cast<int>(std::round(62.0f * s)));
-        const int colorBtnW  = btnH;
-        const int checkW     = btnH;
-        const int textStyleW = std::max(74, static_cast<int>(std::round(86.0f * s)));
-
         place(cmbStroke_, x, comboW, showStroke, true);
         place(btnStrokeColor_, x, colorBtnW, showStroke);
         place(chkFill_, x, checkW, showFill);
@@ -1259,6 +1358,8 @@ void ToolbarWindow::RelayoutVisibleControls()
         place(cmbTextSize_, x, comboW, showText, true);
         place(cmbTextStyle_, x, textStyleW, showText, true);
         place(btnTextColor_, x, colorBtnW, showText);
+        place(cmbRecordDelay_, x, recordComboW, false, true);
+        place(cmbRecordFps_, x, recordComboW, false, true);
 
         if (showStroke || showFill || showText) {
             addGroupSeparator(x);
@@ -1268,7 +1369,12 @@ void ToolbarWindow::RelayoutVisibleControls()
         for (UINT id : actionButtonIds_) {
             HWND h             = buttons_.count(id) ? buttons_[id] : nullptr;
             int w              = buttonWidths_.count(id) ? buttonWidths_[id] : 34;
-            const bool visible = (id != ID_TOOL_TRIM_ABOVE && id != ID_TOOL_TRIM_BELOW);
+            const bool visible = id != ID_TOOL_TRIM_ABOVE &&
+                                 id != ID_TOOL_TRIM_BELOW &&
+                                 id != ID_TOOL_RECORD_TOGGLE &&
+                                 id != ID_TOOL_RECORD_PAUSE &&
+                                 id != ID_TOOL_RECORD_SYSTEM_AUDIO &&
+                                 id != ID_TOOL_RECORD_MIC_AUDIO;
             if (visible && hasAction && (id == ID_TOOL_LONG_CAPTURE || id == ID_TOOL_SAVE || id == ID_TOOL_CANCEL)) {
                 addGroupSeparator(x);
             }
@@ -1284,7 +1390,9 @@ void ToolbarWindow::RelayoutVisibleControls()
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     const int radius = std::max(4, static_cast<int>(std::round(6.0f * s)));
     HRGN rgn         = CreateRoundRectRgn(0, 0, toolbarWidth_ + 1, toolbarHeight_ + 1, radius, radius);
-    SetWindowRgn(hwnd_, rgn, TRUE);
+    if (rgn && SetWindowRgn(hwnd_, rgn, TRUE) == 0) {
+        DeleteObject(rgn);
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -1317,14 +1425,21 @@ void ToolbarWindow::DrawButton(const DRAWITEMSTRUCT *dis)
         if (cid == ID_TOOL_STROKE_WIDTH) return cmbStroke_;
         if (cid == ID_TOOL_TEXT_SIZE) return cmbTextSize_;
         if (cid == ID_TOOL_TEXT_STYLE) return cmbTextStyle_;
+        if (cid == ID_TOOL_RECORD_DELAY) return cmbRecordDelay_;
+        if (cid == ID_TOOL_RECORD_FPS) return cmbRecordFps_;
         return nullptr;
     };
     if (HWND combo = comboHandle(id)) {
-        const bool disabled  = (dis->itemState & ODS_DISABLED) != 0;
-        const bool selected  = (dis->itemState & ODS_SELECTED) != 0;
-        const bool comboFace = (dis->itemID == static_cast<UINT>(-1)) || ((dis->itemState & ODS_COMBOBOXEDIT) != 0);
-        const bool hovered   = hoveredControlId_ == id;
-        // 使用统一的主题色系
+        const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+        const bool selected = (dis->itemState & ODS_SELECTED) != 0;
+        COMBOBOXINFO info{};
+        info.cbSize = sizeof(info);
+        const bool haveComboInfo = GetComboBoxInfo(combo, &info) != FALSE;
+        const HWND drawWnd = WindowFromDC(dis->hDC);
+        const bool drawingListItem = haveComboInfo && info.hwndList && drawWnd == info.hwndList;
+        const bool comboFace = !drawingListItem;
+        const bool hovered   = hoveredControlId_ == id && comboFace && openComboControlId_ != id; // 濞戞挸顑嗘刊铏逛沪閺囩偟纾婚柡鍫㈠枛濡潡宕橀懡銈囨尝闁哄嫬澧介妵姘浖?hover
+        // 濞达綀娉曢弫銈囩磼閻斿墎顏遍柣銊ュ鐎靛本锛愬Ο鍨棌缂?
         COLORREF bg     = comboFace
                               ? (hovered ? RGB(54, 62, 76) : ThemeColors::Component::Toolbar::ComboBoxBgColor)
                               : (selected ? RGB(62, 72, 90) : ThemeColors::Component::Toolbar::ComboBoxBgColor);
@@ -1341,18 +1456,8 @@ void ToolbarWindow::DrawButton(const DRAWITEMSTRUCT *dis)
             Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
         }
 
-        std::wstring itemText;
-        wchar_t buf[128]{};
-        if (dis->itemID != static_cast<UINT>(-1)) {
-            SendMessageW(combo, CB_GETLBTEXT, static_cast<WPARAM>(dis->itemID), reinterpret_cast<LPARAM>(buf));
-            itemText = buf;
-        } else {
-            int cur = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
-            if (cur >= 0) {
-                SendMessageW(combo, CB_GETLBTEXT, static_cast<WPARAM>(cur), reinterpret_cast<LPARAM>(buf));
-                itemText = buf;
-            }
-        }
+        const std::wstring itemText = UiUtil::GetOwnerDrawComboText(
+            combo, comboFace, id, dis->itemID, openComboControlId_, openComboSelectionIndex_);
 
         RECT textRc = dis->rcItem;
         textRc.left += std::max(8, static_cast<int>(std::round(10.0f * (static_cast<float>(dpi_) / 96.0f))));
@@ -1368,11 +1473,17 @@ void ToolbarWindow::DrawButton(const DRAWITEMSTRUCT *dis)
     const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
     const bool hot      = hoveredControlId_ == id;
     const UINT activeId = ButtonIdFromTool(activeTool_);
-    const bool checked  = (id == activeId) || (id == ID_TOOL_FILL_ENABLE && fillEnabledValue_);
+    const bool checked  = (id == activeId) ||
+                         (id == ID_TOOL_FILL_ENABLE && fillEnabledValue_) ||
+                         (id == ID_TOOL_RECORD_TOGGLE && recordingActive_) ||
+                         (id == ID_TOOL_RECORD_PAUSE && recordingActive_ && recordingPaused_) ||
+                         (id == ID_TOOL_RECORD_SYSTEM_AUDIO && recordSystemAudioValue_) ||
+                         (id == ID_TOOL_RECORD_MIC_AUDIO && recordMicrophoneAudioValue_);
 
     COLORREF bg = ThemeColors::Component::Toolbar::ComboBoxBgColor;
     if (checked) {
-        bg = RGB(35, 81, 126);
+        // 闂侇偄顦懙鎴︽偐閼哥鍋撴笟濠勭獥闁糕晞娅ｉ、鍛存嫅濠靛﹤顥忛柤鍐叉湰濞呮瑩鏁嶇仦鎯т壕闁稿绮嶅鍌炲礉閻樺崬鐦?
+        bg = hot ? RGB(45, 100, 160) : RGB(35, 81, 126);
     } else if (pressed) {
         bg = RGB(70, 80, 98);
     } else if (hot) {
@@ -1482,7 +1593,7 @@ void ToolbarWindow::DrawButton(const DRAWITEMSTRUCT *dis)
             gg.Restore(saved);
         }
     } else if (const ButtonDef *def = FindButtonDef(id)) {
-        if (!DrawToolbarIcon(id, dis->hDC, textRc, fg, static_cast<float>(dpi_) / 96.0f)) {
+        if (!DrawToolbarIcon(id, dis->hDC, textRc, fg, static_cast<float>(dpi_) / 96.0f, recordingActive_, recordingPaused_)) {
             SetBkMode(dis->hDC, TRANSPARENT);
             SetTextColor(dis->hDC, fg);
             HFONT useFont = iconFont_ ? iconFont_ : font_;
@@ -1613,8 +1724,9 @@ void ToolbarWindow::SetLongCaptureMode(bool enabled)
     }
     longCaptureMode_ = enabled;
     if (longCaptureMode_) {
-        whiteboardMode_ = false;
-        activeTool_     = ToolType::None;
+        whiteboardMode_      = false;
+        screenRecordingMode_ = false;
+        activeTool_          = ToolType::None;
     }
     RelayoutVisibleControls();
 }
@@ -1626,9 +1738,44 @@ void ToolbarWindow::SetWhiteboardMode(bool enabled)
     }
     whiteboardMode_ = enabled;
     if (whiteboardMode_) {
-        longCaptureMode_ = false;
+        longCaptureMode_     = false;
+        screenRecordingMode_ = false;
     }
     RelayoutVisibleControls();
+}
+
+void ToolbarWindow::SetScreenRecordingMode(bool enabled)
+{
+    if (screenRecordingMode_ == enabled) {
+        return;
+    }
+    screenRecordingMode_ = enabled;
+    if (screenRecordingMode_) {
+        longCaptureMode_ = false;
+        whiteboardMode_  = false;
+        activeTool_      = ToolType::None;
+    } else {
+        recordingActive_ = false;
+        recordingPaused_ = false;
+    }
+    ApplyRecordingControlState();
+    RelayoutVisibleControls();
+}
+
+void ToolbarWindow::SetRecordingState(bool active, bool paused)
+{
+    if (recordingActive_ == active && recordingPaused_ == paused) {
+        return;
+    }
+    recordingActive_ = active;
+    recordingPaused_ = active ? paused : false;
+    ApplyRecordingControlState();
+    if (HWND recordBtn = ControlById(ID_TOOL_RECORD_TOGGLE)) {
+        InvalidateRect(recordBtn, nullptr, FALSE);
+    }
+    if (HWND pauseBtn = ControlById(ID_TOOL_RECORD_PAUSE)) {
+        InvalidateRect(pauseBtn, nullptr, FALSE);
+    }
 }
 
 float ToolbarWindow::StrokeWidth() const
@@ -1662,6 +1809,32 @@ INT ToolbarWindow::TextStyle() const
     default:
         return Gdiplus::FontStyleRegular;
     }
+}
+
+int ToolbarWindow::RecordingDelayMs() const
+{
+    return std::max(0, ComboIntValue(cmbRecordDelay_, std::max(0, recordingDelayMsValue_ / 1000))) * 1000;
+}
+
+int ToolbarWindow::RecordingFps() const
+{
+    return std::clamp(ComboIntValue(cmbRecordFps_, recordingFpsValue_), 5, 60);
+}
+
+void ToolbarWindow::ApplyRecordingControlState()
+{
+    recordingDelayMsValue_ = RecordingDelayMs();
+    recordingFpsValue_     = RecordingFps();
+    auto setEnabled        = [&](UINT id, BOOL enabled) {
+        if (HWND control = ControlById(id)) {
+            EnableWindow(control, enabled);
+        }
+    };
+    setEnabled(ID_TOOL_RECORD_DELAY, recordingActive_ ? FALSE : TRUE);
+    setEnabled(ID_TOOL_RECORD_FPS, recordingActive_ ? FALSE : TRUE);
+    setEnabled(ID_TOOL_RECORD_SYSTEM_AUDIO, recordingActive_ ? FALSE : TRUE);
+    setEnabled(ID_TOOL_RECORD_MIC_AUDIO, recordingActive_ ? FALSE : TRUE);
+    setEnabled(ID_TOOL_RECORD_PAUSE, recordingActive_ ? TRUE : FALSE);
 }
 
 UINT_PTR CALLBACK ToolbarWindow::ColorDialogHookProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1855,10 +2028,12 @@ void ToolbarWindow::UpdateDpiFont()
     }
     bool dpiChanged = dpi_ != dpi;
     if (dpiChanged) {
-        strokeWidthValue_ = StrokeWidth();
-        textSizeValue_    = TextSize();
-        textStyleValue_   = TextStyle();
-        fillEnabledValue_ = FillEnabled();
+        strokeWidthValue_      = StrokeWidth();
+        textSizeValue_         = TextSize();
+        textStyleValue_        = TextStyle();
+        fillEnabledValue_      = FillEnabled();
+        recordingDelayMsValue_ = RecordingDelayMs();
+        recordingFpsValue_     = RecordingFps();
 
         dpi_ = dpi;
         std::vector<HWND> children;
@@ -1876,6 +2051,8 @@ void ToolbarWindow::UpdateDpiFont()
         cmbTextSize_    = nullptr;
         cmbTextStyle_   = nullptr;
         btnTextColor_   = nullptr;
+        cmbRecordDelay_ = nullptr;
+        cmbRecordFps_   = nullptr;
 
         CreateButtons();
     } else if (font_ != nullptr && iconFont_ != nullptr) {
@@ -1908,3 +2085,9 @@ void ToolbarWindow::UpdateDpiFont()
         SendMessageW(tooltip_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
     }
 }
+
+
+
+
+
+

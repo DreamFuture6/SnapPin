@@ -92,6 +92,31 @@ src/
 - MSVC v143 工具链
 - Windows SDK
 
+### 录频导出（FFmpeg）依赖
+
+录频“非原生画质”导出使用 FFmpeg（库方式，不依赖系统安装）。
+
+项目会在 CMake 配置阶段自动下载并集成 FFmpeg SDK（Windows x64 shared）：
+
+说明：
+
+- 首次构建时，自动下载压缩包并解压到 `build/_deps/ffmpeg`
+- 首次下载成功后，自动复制一份到项目目录 `third_party/ffmpeg`
+- 后续构建若检测到 `third_party/ffmpeg` 完整存在，则直接使用本地文件，不再联网下载
+- 自动链接 `import library`（`*.lib`）
+- 构建后自动拷贝 `avcodec/avformat/avutil/swscale` 相关 DLL 到可执行文件目录
+- 目标机器无需安装 FFmpeg，只需随程序分发 `SnapPin.exe` 与同目录下的 FFmpeg DLL
+- 如需固定版本或使用镜像源，可设置 `-DSNAPPIN_FFMPEG_DOWNLOAD_URL=<url>`
+
+可选：生成裁剪版 FFmpeg（显著减小 DLL 体积）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/ffmpeg/build_minimal_msvc.ps1
+```
+
+执行后会将最小化构建结果写入 `third_party/ffmpeg`，后续 CMake 配置将优先使用本地裁剪版。
+默认需要本机存在 `D:\Software\msys64`，可通过 `-MsysRoot` 传入你的 MSYS2 路径。
+
 ## 构建方式
 
 ### 方式一：使用 Visual Studio

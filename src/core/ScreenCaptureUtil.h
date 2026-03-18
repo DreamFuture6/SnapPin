@@ -5,6 +5,6 @@
 
 namespace ScreenCaptureUtil {
 
-bool CaptureScreenRect(const RECT& screenRect, Image& outImage);
+bool CaptureScreenRect(const RECT& screenRect, Image& outImage, bool captureLayeredWindows = true, bool captureCursor = false);
 
 } // namespace ScreenCaptureUtil

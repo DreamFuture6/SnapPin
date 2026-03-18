@@ -662,7 +662,9 @@ void HistoryWindow::ApplyFlyoutClip()
 
     HRGN rgn = CreateRectRgn(0, 0, w, visibleH);
     if (rgn) {
-        SetWindowRgn(hwnd_, rgn, TRUE);
+        if (SetWindowRgn(hwnd_, rgn, TRUE) == 0) {
+            DeleteObject(rgn);
+        }
     }
 }
 

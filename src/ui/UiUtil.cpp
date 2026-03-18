@@ -133,7 +133,226 @@ void ApplyRoundedRegion(HWND hwnd, int radiusPx) {
     }
     const int dia = std::max(2, radiusPx * 2);
     HRGN rgn = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, dia, dia);
-    SetWindowRgn(hwnd, rgn, TRUE);
+    if (rgn && SetWindowRgn(hwnd, rgn, TRUE) == 0) {
+        DeleteObject(rgn);
+    }
+}
+
+void ConfigureComboControl(HWND combo, int controlHeight, int visibleItems, int minItemHeight, int verticalPadding) {
+    if (!combo) {
+        return;
+    }
+    const int itemHeight = std::max(minItemHeight, controlHeight - verticalPadding);
+    SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), static_cast<LPARAM>(itemHeight));
+    SendMessageW(combo, CB_SETITEMHEIGHT, 0, static_cast<LPARAM>(itemHeight));
+    SendMessageW(combo, CB_SETMINVISIBLE, static_cast<WPARAM>(visibleItems), 0);
+}
+
+void ApplyStableComboTheme(HWND combo) {
+    if (!combo) {
+        return;
+    }
+    using SetWindowThemeFn = HRESULT(WINAPI *)(HWND, LPCWSTR, LPCWSTR);
+    static SetWindowThemeFn setTheme = []() -> SetWindowThemeFn {
+        HMODULE h = LoadLibraryW(L"uxtheme.dll");
+        if (!h) {
+            return nullptr;
+        }
+        return reinterpret_cast<SetWindowThemeFn>(GetProcAddress(h, "SetWindowTheme"));
+    }();
+    if (setTheme) {
+        setTheme(combo, L"", L"");
+    }
+
+    LONG_PTR ex = GetWindowLongPtrW(combo, GWL_EXSTYLE);
+    if ((ex & WS_EX_CLIENTEDGE) != 0) {
+        SetWindowLongPtrW(combo, GWL_EXSTYLE, ex & ~WS_EX_CLIENTEDGE);
+        SetWindowPos(combo, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    LONG_PTR style = GetWindowLongPtrW(combo, GWL_STYLE);
+    if ((style & WS_BORDER) != 0) {
+        SetWindowLongPtrW(combo, GWL_STYLE, style & ~WS_BORDER);
+        SetWindowPos(combo, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    SendMessageW(combo, CB_SETEXTENDEDUI, TRUE, 0);
+}
+
+void EnsureComboListTopMost(HWND combo) {
+    if (!combo) {
+        return;
+    }
+    COMBOBOXINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetComboBoxInfo(combo, &info) && info.hwndList) {
+        SetWindowPos(info.hwndList, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+std::wstring GetComboItemText(HWND combo, int itemIndex) {
+    if (!combo || itemIndex < 0) {
+        return {};
+    }
+    const LRESULT length = SendMessageW(combo, CB_GETLBTEXTLEN, static_cast<WPARAM>(itemIndex), 0);
+    if (length == CB_ERR || length < 0) {
+        return {};
+    }
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    const LRESULT copied = SendMessageW(combo, CB_GETLBTEXT, static_cast<WPARAM>(itemIndex),
+                                        reinterpret_cast<LPARAM>(text.data()));
+    if (copied == CB_ERR || copied < 0) {
+        return {};
+    }
+    text.resize(static_cast<size_t>(copied));
+    return text;
+}
+
+std::wstring GetComboSelectionOrWindowText(HWND combo, int selectionOverride) {
+    if (!combo) {
+        return {};
+    }
+    const int selection = selectionOverride >= 0
+        ? selectionOverride
+        : static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+    if (selection >= 0) {
+        return GetComboItemText(combo, selection);
+    }
+
+    const int length = GetWindowTextLengthW(combo);
+    if (length <= 0) {
+        return {};
+    }
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    const int copied = GetWindowTextW(combo, text.data(), length + 1);
+    if (copied <= 0) {
+        return {};
+    }
+    text.resize(static_cast<size_t>(copied));
+    return text;
+}
+
+std::wstring GetOwnerDrawComboText(HWND combo, bool comboFace, UINT controlId, UINT itemId,
+    UINT openComboControlId, int openComboSelectionIndex) {
+    if (!combo) {
+        return {};
+    }
+    if (comboFace) {
+        int selection = static_cast<int>(SendMessageW(combo, CB_GETCURSEL, 0, 0));
+        if (openComboControlId == controlId && openComboSelectionIndex >= 0) {
+            selection = openComboSelectionIndex;
+        }
+        if (selection < 0) {
+            return {};
+        }
+        return GetComboItemText(combo, selection);
+    }
+    if (itemId == static_cast<UINT>(-1)) {
+        return {};
+    }
+    return GetComboItemText(combo, static_cast<int>(itemId));
+}
+
+float ParseFloatOrFallback(const std::wstring& text, float fallback) {
+    if (text.empty()) {
+        return fallback;
+    }
+    wchar_t* end = nullptr;
+    const float value = static_cast<float>(wcstod(text.c_str(), &end));
+    return end == text.c_str() ? fallback : value;
+}
+
+HWND CreateTrackedTooltipWindow(HWND owner, HFONT font) {
+    if (!owner || !IsWindow(owner)) {
+        return nullptr;
+    }
+    HWND tooltip = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"STATIC",
+        L"",
+        WS_POPUP | SS_CENTER | SS_CENTERIMAGE | WS_BORDER,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        nullptr,
+        nullptr,
+        reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(owner, GWLP_HINSTANCE)),
+        nullptr);
+    if (!tooltip) {
+        return nullptr;
+    }
+    if (font) {
+        SendMessageW(tooltip, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+    }
+    SetWindowPos(tooltip, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+    return tooltip;
+}
+
+void HideTrackedTooltipWindow(HWND tooltip, bool& visible) {
+    if (tooltip) {
+        ShowWindow(tooltip, SW_HIDE);
+    }
+    visible = false;
+}
+
+void DestroyTrackedTooltipWindow(HWND& tooltip, bool& visible, std::wstring& textCache) {
+    HideTrackedTooltipWindow(tooltip, visible);
+    if (tooltip) {
+        DestroyWindow(tooltip);
+        tooltip = nullptr;
+    }
+    textCache.clear();
+    visible = false;
+}
+
+void ShowTrackedTooltipWindow(HWND owner, HWND tooltip, HFONT font, const std::wstring& text,
+    std::wstring& textCache, bool& visible, POINT screenPt) {
+    if (!owner || !tooltip || text.empty()) {
+        HideTrackedTooltipWindow(tooltip, visible);
+        return;
+    }
+
+    if (textCache != text) {
+        textCache = text;
+        SetWindowTextW(tooltip, textCache.c_str());
+    }
+
+    RECT textRc{0, 0, 0, 0};
+    if (HDC hdc = GetDC(tooltip)) {
+        HFONT oldFont = nullptr;
+        if (font) {
+            oldFont = reinterpret_cast<HFONT>(SelectObject(hdc, font));
+        }
+        DrawTextW(hdc, textCache.c_str(), -1, &textRc, DT_CALCRECT | DT_SINGLELINE);
+        if (oldFont) {
+            SelectObject(hdc, oldFont);
+        }
+        ReleaseDC(tooltip, hdc);
+    }
+
+    const int padX = 12;
+    const int padY = 8;
+    const int width = std::max(60, RectWidth(textRc) + padX * 2);
+    const int height = std::max(24, RectHeight(textRc) + padY);
+    int x = screenPt.x + 14;
+    int y = screenPt.y + 24;
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    const HMONITOR mon = MonitorFromPoint(screenPt, MONITOR_DEFAULTTONEAREST);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+        x = std::clamp(x, static_cast<int>(mi.rcWork.left),
+                       std::max(static_cast<int>(mi.rcWork.left), static_cast<int>(mi.rcWork.right - width)));
+        y = std::clamp(y, static_cast<int>(mi.rcWork.top),
+                       std::max(static_cast<int>(mi.rcWork.top), static_cast<int>(mi.rcWork.bottom - height)));
+    }
+
+    if (font) {
+        SendMessageW(tooltip, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+    }
+    SetWindowPos(tooltip, HWND_TOPMOST, x, y, width, height,
+                 SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    visible = true;
 }
 
 HWND CreateChildControl(HWND parent, HINSTANCE hInstance, LPCWSTR className, LPCWSTR text,

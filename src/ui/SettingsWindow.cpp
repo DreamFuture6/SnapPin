@@ -4,6 +4,7 @@
 #include "ui/UiUtil.h"
 #include "ui/ThemeColors.h"
 #include "resource.h"
+#include "common/KnownFolderUtil.h"
 
 namespace
 {
@@ -211,12 +212,7 @@ namespace
 
     std::wstring DefaultPinSavePath()
     {
-        PWSTR path = nullptr;
-        std::filesystem::path out;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &path)) && path) {
-            out = std::filesystem::path(path) / L"SnapPin" / L"History";
-            CoTaskMemFree(path);
-        }
+        std::filesystem::path out = KnownFolderUtil::GetPathOr(FOLDERID_LocalAppData, std::filesystem::temp_directory_path()) / L"SnapPin" / L"History";
         if (out.empty()) {
             out = std::filesystem::temp_directory_path() / L"SnapPin" / L"History";
         }
@@ -1022,7 +1018,7 @@ void SettingsWindow::ApplyToControls()
     paddleOcrApiUrlEdit_.SetText(current_.paddleOcrApiUrl);
     paddleOcrTokenEdit_.SetText(current_.paddleOcrAccessToken);
 
-    SetWindowTextW(lblVersion_, L"版本：v0.1.0");
+    SetWindowTextW(lblVersion_, L"版本：v0.2.0");
     SetWindowTextW(lblAuthorPrefix_, L"作者：");
     SetWindowTextW(lblAuthor_, L"DreamFuture6");
     const std::wstring buildText = L"编译日期：" + Utf8ToWide(std::string(__DATE__) + " " + __TIME__);
@@ -1303,16 +1299,7 @@ bool SettingsWindow::SaveSettingsToIni(const std::filesystem::path &path, const 
 
 std::filesystem::path SettingsWindow::DesktopDirectory() const
 {
-    PWSTR path = nullptr;
-    std::filesystem::path out;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &path)) && path) {
-        out = path;
-        CoTaskMemFree(path);
-    }
-    if (out.empty()) {
-        out = std::filesystem::temp_directory_path();
-    }
-    return out;
+    return KnownFolderUtil::GetPathOr(FOLDERID_Desktop, std::filesystem::temp_directory_path());
 }
 
 LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam)
